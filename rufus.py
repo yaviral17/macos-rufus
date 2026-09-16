@@ -369,14 +369,18 @@ def copy_wim_direct(wim_path: Path, dst: Path):
         console=console,
     ) as progress:
         task = progress.add_task("wim", total=size, filename=wim_path.name)
+        # Deliberately not os.sendfile: on macOS/BSD sendfile(2) requires the
+        # destination fd to be a socket and fails with ENOTSOCK for file->file.
+        # readinto on a reused buffer keeps this allocation-free per chunk.
+        buf = bytearray(chunk)
+        view = memoryview(buf)
         with open(wim_path, "rb") as fsrc, open(dst_file, "wb") as fdst:
-            in_fd, out_fd, offset = fsrc.fileno(), fdst.fileno(), 0
-            while offset < size:
-                sent = os.sendfile(out_fd, in_fd, offset, min(chunk, size - offset))
-                if sent == 0:
+            while True:
+                n = fsrc.readinto(buf)
+                if not n:
                     break
-                offset += sent
-                progress.advance(task, sent)
+                fdst.write(view[:n])
+                progress.advance(task, n)
     shutil.copystat(wim_path, dst_file)
 
 

@@ -161,7 +161,7 @@ The tool will:
 3. Set the MBR active partition flag (legacy BIOS boot requirement)
 4. Write the Windows FAT32 VBR from `boot/bootsect.dat` in the ISO (Win7 support)
 5. Copy all boot files in parallel (4 threads, 1 MB buffers) with live progress bar
-6. Copy `install.wim` via `os.sendfile` with speed + ETA display — or split automatically if > 4 GiB
+6. Copy `install.wim` in 4 MB chunks with speed + ETA display — or split automatically if > 4 GiB
 7. Flush writes and unmount cleanly
 
 ---
@@ -225,7 +225,7 @@ MBR + FAT32 is chosen deliberately:
 | `diskutil` | macOS built-in | List disks, erase, format, mount/unmount |
 | `wimlib-imagex` | Homebrew (`wimlib`) | Split install.wim > 4 GiB |
 | `rich` | pip | Terminal UI — progress bars, tables, color |
-| Python `os.sendfile` | stdlib | Kernel-space WIM copy — no userspace buffer overhead |
+| Python `readinto` | stdlib | Chunked WIM copy into a reused buffer — no per-chunk allocation |
 | Python `ThreadPoolExecutor` | stdlib | Parallel boot file copy across 4 threads |
 | Python `struct` | stdlib | Write MBR active flag + merge VBR sectors |
 
