@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """macos-rufus: create bootable Windows USB drives on macOS."""
 
+import json
 import logging
 import os
 import plistlib
+import re
 import shutil
 import subprocess
 import sys
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
+import requests
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import (BarColumn, FileSizeColumn, MofNCompleteColumn,
@@ -90,6 +94,573 @@ def check_deps():
             "wimlib", "wimlib-imagex",
             "needed for Windows 11 ISOs where install.wim > 4 GiB"
         )
+
+
+# ── OS catalog & ISO download ────────────────────────────────────────────────
+
+# Microsoft only exposes the "no Media Creation Tool" ISO download API for
+# Windows 10 and 11. Older versions require a product key / retired download
+# pages, so those stay manual-path-only.
+OS_CATALOG = [
+    {"name": "Windows 11", "slug": "windows11", "dynamic": True},
+    {"name": "Windows 10", "slug": "windows10ISO", "dynamic": True},
+    {"name": "Windows 8.1", "slug": None, "dynamic": False},
+    {"name": "Windows 7", "slug": None, "dynamic": False},
+    {"name": "I already have an ISO file", "slug": None, "dynamic": False},
+]
+
+# Spoofing a non-Windows browser is required — Microsoft's download API
+# redirects real Windows user agents to the Media Creation Tool instead of
+# handing back a direct ISO link.
+_DOWNLOAD_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
+)
+_MS_ORG_ID = "y6jn8c31"
+_MS_PROFILE = "606624d44113"
+
+_ISO_STATE_SUFFIX = ".json"  # sidecar next to a "*.iso.part" file
+
+
+# The whole script re-execs itself under `sudo` (see escalate_to_root), which
+# resets $HOME to root's. Resolve the actual logged-in user's home so
+# downloads land in *their* ~/Downloads, not /var/root's.
+def get_user_home() -> Path:
+    login_user = os.environ.get("SUDO_USER")
+    if login_user:
+        try:
+            import pwd
+            return Path(pwd.getpwnam(login_user).pw_dir)
+        except KeyError:
+            pass
+    return Path.home()
+
+
+def _chown_to_login_user(path: Path):
+    login_user = os.environ.get("SUDO_USER")
+    if not login_user or os.geteuid() != 0:
+        return
+    try:
+        import pwd
+        pw = pwd.getpwnam(login_user)
+    except KeyError:
+        return
+    for p in (path, *path.rglob("*")) if path.is_dir() else (path,):
+        try:
+            os.chown(p, pw.pw_uid, pw.pw_gid)
+        except OSError:
+            pass
+
+
+def get_downloads_dir() -> Path:
+    d = get_user_home() / "Downloads" / "macos-rufus" / "isos"
+    d.mkdir(parents=True, exist_ok=True)
+    _chown_to_login_user(get_user_home() / "Downloads" / "macos-rufus")
+    return d
+
+
+def find_existing_isos(entry: dict, downloads_dir: Path) -> list[Path]:
+    prefix = entry["name"].replace(" ", "").replace(".", "")
+    matches = sorted(downloads_dir.glob(f"{prefix}_*.iso"),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+    return matches
+
+
+def find_incomplete_downloads(downloads_dir: Path) -> list[dict]:
+    """Partial downloads left behind by an interrupted run — each ``*.iso.part``
+    has a JSON sidecar with everything needed to resume or regenerate the link."""
+    found = []
+    for part in downloads_dir.glob("*.iso.part"):
+        state_path = part.with_name(part.name + _ISO_STATE_SUFFIX)
+        if not state_path.exists():
+            continue
+        try:
+            state = json.loads(state_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        found.append({"state": state, "part_path": part, "state_path": state_path})
+    return found
+
+
+def _write_download_state(tmp_dest: Path, state: dict):
+    state_path = tmp_dest.with_name(tmp_dest.name + _ISO_STATE_SUFFIX)
+    state_path.write_text(json.dumps(state, indent=2))
+    _chown_to_login_user(state_path)
+
+
+def _ms_download_session(slug: str) -> requests.Session:
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": _DOWNLOAD_UA,
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": f"https://www.microsoft.com/en-us/software-download/{slug}",
+        "X-Requested-With": "XMLHttpRequest",
+    })
+    try:
+        s.get("https://vlscppe.microsoft.com/tags",
+              params={"org_id": _MS_ORG_ID, "session_id": str(uuid.uuid4())},
+              timeout=15)
+    except requests.RequestException:
+        pass  # best-effort warm-up; not fatal if it fails
+    return s
+
+
+def fetch_product_editions(session: requests.Session, slug: str) -> list[tuple[str, str]]:
+    """Scrape the download page's <select> options for edition IDs — avoids
+    hardcoding IDs that Microsoft rotates with every release."""
+    resp = session.get(f"https://www.microsoft.com/en-us/software-download/{slug}",
+                        headers={"Accept": "text/html"}, timeout=20)
+    resp.raise_for_status()
+    options = re.findall(
+        r'<option value="(\d+)"[^>]*>\s*([^<]+?)\s*</option>', resp.text
+    )
+    if not options:
+        raise RuntimeError("Could not find a downloadable edition on Microsoft's page.")
+    return options
+
+
+def fetch_skus(session: requests.Session, edition_id: str, session_id: str) -> list[dict]:
+    resp = session.get(
+        "https://www.microsoft.com/software-download-connector/api/getskuinformationbyproductedition",
+        params={
+            "profile": _MS_PROFILE,
+            "ProductEditionId": edition_id,
+            "SKU": "undefined",
+            "friendlyFileName": "undefined",
+            "Locale": "en-US",
+            "sessionID": session_id,
+        },
+        timeout=20,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("Errors"):
+        msgs = ", ".join(e.get("Value", "") for e in data["Errors"])
+        raise RuntimeError(f"Microsoft rejected the request: {msgs}")
+    skus = data.get("Skus") or []
+    if not skus:
+        raise RuntimeError(
+            "Microsoft returned no language editions — this usually means the "
+            "download API is rate-limiting this network/session."
+        )
+    return skus
+
+
+def _ensure_playwright_ready():
+    """GetProductDownloadLinksBySku (the call that returns the actual ISO URL)
+    sits behind Microsoft's bot detection ("Sentinel") — it rejects plain HTTP
+    clients even with identical headers/params to a real browser, because it
+    checks a JS-computed device-fingerprint token that can't be forged without
+    running the real page. A real (headless) browser passes it every time, so
+    we drive one instead. This just makes sure Chromium is installed."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        raise RuntimeError(
+            "The 'playwright' package is required for automatic ISO downloads. "
+            "Install it with: pip install playwright"
+        )
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            browser.close()
+        return
+    except Exception as e:
+        if "Executable doesn't exist" not in str(e):
+            raise
+    console.print(
+        "\n[yellow]Playwright's Chromium browser isn't installed yet[/yellow] — "
+        "it's needed to get past Microsoft's bot-check on the download page."
+    )
+    if not Confirm.ask("Install it now (one-time download, ~150-300 MB)?", default=True):
+        raise RuntimeError("Playwright's Chromium browser is required for automatic downloads.")
+    result = subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"])
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Failed to install Playwright's Chromium browser. "
+            "Run manually: python3 -m playwright install chromium"
+        )
+    console.print("[green]✓ Chromium installed[/green]")
+
+
+def fetch_download_links(slug: str, edition_id: str, sku_id: str, sku_language: str) -> list[dict]:
+    """Drive a real headless browser through Microsoft's own download page to
+    get the ISO link, instead of calling GetProductDownloadLinksBySku
+    directly — see _ensure_playwright_ready for why."""
+    from playwright.sync_api import sync_playwright
+
+    option_value = json.dumps({"id": sku_id, "language": sku_language}, separators=(",", ":"))
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        try:
+            page = browser.new_page(user_agent=_DOWNLOAD_UA)
+            page.goto(f"https://www.microsoft.com/en-us/software-download/{slug}",
+                      wait_until="networkidle", timeout=60000)
+            page.wait_for_timeout(500)
+            page.select_option("#product-edition", edition_id)
+            with page.expect_response(lambda r: "getskuinformationbyproductedition" in r.url, timeout=30000):
+                page.click("#submit-product-edition")
+            page.select_option("#product-languages", option_value)
+            with page.expect_response(lambda r: "GetProductDownloadLinksBySku" in r.url, timeout=30000) as ri:
+                page.click("#submit-sku")
+            resp = ri.value
+            if resp.status != 200:
+                raise RuntimeError(f"Microsoft returned HTTP {resp.status} for the download link request.")
+            data = resp.json()
+        finally:
+            browser.close()
+
+    errs = (data.get("ValidationContainer") or {}).get("Errors") or data.get("Errors")
+    if errs:
+        msgs = ", ".join(e.get("Value", "") for e in errs)
+        raise RuntimeError(f"Microsoft rejected the request: {msgs}")
+    options = data.get("ProductDownloadOptions") or []
+    if not options:
+        raise RuntimeError(
+            "Microsoft returned no download links — the ISO may no longer be "
+            "offered for this edition/language."
+        )
+    return options
+
+
+def _describe_download_option(opt: dict) -> str:
+    name = opt.get("Name") or opt.get("LocalizedProductDisplayName") or "Download"
+    m = re.search(r"(x64|x86|x32|arm64)", opt.get("Uri", ""), re.IGNORECASE)
+    return f"{name} ({m.group(1).lower()})" if m else name
+
+
+def _extract_arch(url: str) -> str:
+    m = re.search(r"(x64|x86|x32|arm64)", url, re.IGNORECASE)
+    return m.group(1).lower() if m else "unknown"
+
+
+def ask_download_option_choice(options: list[dict]) -> dict:
+    """Microsoft can return more than one download (e.g. different
+    architectures) — show them all so the user picks the right one."""
+    t = Table(title="Select Download", show_lines=True)
+    t.add_column("#", style="bold cyan", width=3)
+    t.add_column("Option")
+    for i, opt in enumerate(options, 1):
+        t.add_row(str(i), _describe_download_option(opt))
+    console.print()
+    console.print(t)
+    while True:
+        raw = Prompt.ask("[bold cyan]Select download option number[/bold cyan]")
+        try:
+            idx = int(raw) - 1
+            if 0 <= idx < len(options):
+                return options[idx]
+        except ValueError:
+            pass
+        console.print(f"[red]Enter 1–{len(options)}.[/red]")
+
+
+def _pick_download_option(options: list[dict], previous_name: str | None = None) -> dict:
+    if len(options) == 1:
+        return options[0]
+    if previous_name:
+        match = next((o for o in options if o.get("Name") == previous_name), None)
+        if match:
+            return match
+    return ask_download_option_choice(options)
+
+
+def download_iso_with_progress(session: requests.Session, url: str, dest: Path, resume: bool = False,
+                                progress_cb=None, should_pause=None):
+    """progress_cb(downloaded_bytes, total_bytes) is called after every chunk
+    when given — used by the GUI instead of the Rich progress bar.
+    should_pause() is polled between chunks when given; if it returns True,
+    the download stops cleanly (like a Ctrl+C pause) instead of continuing —
+    used by the GUI's Pause button."""
+    tmp_dest = dest.with_suffix(".iso.part")
+    headers = {}
+    initial = 0
+    if resume and tmp_dest.exists():
+        initial = tmp_dest.stat().st_size
+        headers["Range"] = f"bytes={initial}-"
+
+    with session.get(url, stream=True, timeout=30, headers=headers) as resp:
+        if resume and resp.status_code == 416:
+            resp.close()
+            console.print(f"[green]✓ {dest.name} was already fully downloaded[/green]")
+        else:
+            resp.raise_for_status()
+            mode = "wb"
+            if resp.status_code == 206:
+                mode = "ab"
+                content_range = resp.headers.get("Content-Range", "")
+                total = int(content_range.rsplit("/", 1)[-1]) if "/" in content_range \
+                    else initial + int(resp.headers.get("Content-Length", 0))
+            else:
+                # Server ignored the Range request (or this is a fresh download) — start over.
+                initial = 0
+                total = int(resp.headers.get("Content-Length", 0))
+
+            if progress_cb is None:
+                console.print(
+                    f"\n[dim]{'Resuming' if mode == 'ab' else 'Downloading'} {dest.name}... "
+                    "(Ctrl+C to pause — progress is saved and can be resumed later)[/dim]"
+                )
+            try:
+                if progress_cb is not None:
+                    downloaded = initial
+                    progress_cb(downloaded, total)
+                    with open(tmp_dest, mode) as f:
+                        for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                            if chunk:
+                                f.write(chunk)
+                                downloaded += len(chunk)
+                                progress_cb(downloaded, total)
+                            if should_pause is not None and should_pause():
+                                raise KeyboardInterrupt
+                else:
+                    with Progress(
+                        TextColumn("[cyan]{task.fields[filename]}[/cyan]",
+                                   table_column=Column(width=35, no_wrap=True)),
+                        BarColumn(),
+                        FileSizeColumn(),
+                        TransferSpeedColumn(),
+                        TimeRemainingColumn(),
+                        console=console,
+                    ) as progress:
+                        task = progress.add_task("dl", total=total or None, filename=dest.name, completed=initial)
+                        with open(tmp_dest, mode) as f:
+                            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                                if chunk:
+                                    f.write(chunk)
+                                    progress.advance(task, len(chunk))
+            except KeyboardInterrupt:
+                so_far = tmp_dest.stat().st_size if tmp_dest.exists() else 0
+                if progress_cb is None:
+                    pct = f" ({so_far * 100 // total}%)" if total else ""
+                    console.print(
+                        f"\n[yellow]Paused[/yellow] — {fmt_size(so_far)}{pct} of {dest.name} saved. "
+                        "Run macos-rufus again to resume from here."
+                    )
+                    raise SystemExit(0)
+                raise  # let the GUI's caller decide how to report the pause
+
+    tmp_dest.rename(dest)
+    tmp_dest.with_name(tmp_dest.name + _ISO_STATE_SUFFIX).unlink(missing_ok=True)
+    _chown_to_login_user(dest)
+
+
+def ask_os_choice() -> dict:
+    t = Table(title="Select Operating System", show_lines=True)
+    t.add_column("#", style="bold cyan", width=3)
+    t.add_column("OS")
+    t.add_column("Auto-download")
+    for i, entry in enumerate(OS_CATALOG, 1):
+        t.add_row(str(i), entry["name"],
+                   "[green]Yes[/green]" if entry["dynamic"] else "[dim]No — manual ISO only[/dim]")
+    console.print()
+    console.print(t)
+
+    while True:
+        raw = Prompt.ask("[bold cyan]Select an OS[/bold cyan]")
+        try:
+            idx = int(raw) - 1
+            if 0 <= idx < len(OS_CATALOG):
+                return OS_CATALOG[idx]
+        except ValueError:
+            pass
+        console.print(f"[red]Enter 1–{len(OS_CATALOG)}.[/red]")
+
+
+def ask_existing_iso_choice(entry: dict, found: list[Path]) -> Path | None:
+    """If matching ISOs already sit in the managed downloads folder, offer to
+    reuse one instead of downloading again."""
+    t = Table(title=f"Existing {entry['name']} ISOs found", show_lines=True)
+    t.add_column("#", style="bold cyan", width=3)
+    t.add_column("File")
+    t.add_column("Size", justify="right")
+    t.add_column("Downloaded")
+    for i, p in enumerate(found, 1):
+        stat = p.stat()
+        t.add_row(str(i), p.name, fmt_size(stat.st_size),
+                   datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"))
+    console.print()
+    console.print(t)
+
+    if not Confirm.ask("Use one of these instead of downloading again?", default=True):
+        return None
+    if len(found) == 1:
+        return found[0]
+    while True:
+        raw = Prompt.ask("[bold cyan]Select file number[/bold cyan]")
+        try:
+            idx = int(raw) - 1
+            if 0 <= idx < len(found):
+                return found[idx]
+        except ValueError:
+            pass
+        console.print(f"[red]Enter 1–{len(found)}.[/red]")
+
+
+def download_windows_iso(entry: dict, downloads_dir: Path) -> Path:
+    session = _ms_download_session(entry["slug"])
+    session_id = str(uuid.uuid4())
+
+    console.print(f"\n[dim]Contacting Microsoft for {entry['name']} download options...[/dim]")
+    editions = fetch_product_editions(session, entry["slug"])
+    if len(editions) == 1:
+        edition_id, edition_name = editions[0]
+    else:
+        t = Table(title="Select Edition", show_lines=True)
+        t.add_column("#", style="bold cyan", width=3)
+        t.add_column("Edition")
+        for i, (_, name) in enumerate(editions, 1):
+            t.add_row(str(i), name)
+        console.print(t)
+        while True:
+            raw = Prompt.ask("[bold cyan]Select edition number[/bold cyan]")
+            try:
+                idx = int(raw) - 1
+                if 0 <= idx < len(editions):
+                    edition_id, edition_name = editions[idx]
+                    break
+            except ValueError:
+                pass
+            console.print(f"[red]Enter 1–{len(editions)}.[/red]")
+
+    skus = fetch_skus(session, edition_id, session_id)
+    t = Table(title="Select Language", show_lines=True)
+    t.add_column("#", style="bold cyan", width=3)
+    t.add_column("Language")
+    for i, sku in enumerate(skus, 1):
+        t.add_row(str(i), sku.get("LocalizedLanguage", sku.get("Language", "?")))
+    console.print()
+    console.print(t)
+    while True:
+        raw = Prompt.ask("[bold cyan]Select language number[/bold cyan]")
+        try:
+            idx = int(raw) - 1
+            if 0 <= idx < len(skus):
+                sku = skus[idx]
+                break
+        except ValueError:
+            pass
+        console.print(f"[red]Enter 1–{len(skus)}.[/red]")
+
+    _ensure_playwright_ready()
+    console.print("[dim]Opening a headless browser to get past Microsoft's download-page bot-check...[/dim]")
+    links = fetch_download_links(entry["slug"], edition_id, sku["Id"], sku["Language"])
+    chosen = _pick_download_option(links)
+    url = chosen["Uri"]
+
+    arch = _extract_arch(url)
+    lang = sku.get("Language", "en-us")
+    filename = f"{entry['name'].replace(' ', '').replace('.', '')}_{lang}_{arch}.iso"
+    dest = downloads_dir / filename
+
+    state = {
+        "entry_name": entry["name"],
+        "slug": entry["slug"],
+        "edition_id": edition_id,
+        "sku_id": sku["Id"],
+        "sku_language": sku.get("LocalizedLanguage"),
+        "sku_language_raw": sku["Language"],
+        "option_name": chosen.get("Name"),
+        "url": url,
+        "dest": str(dest),
+        "created": datetime.now().isoformat(),
+    }
+    _write_download_state(dest.with_suffix(".iso.part"), state)
+
+    console.print(f"[green]✓ Got download link[/green] — saving to {dest}")
+    download_iso_with_progress(session, url, dest)
+    console.print(f"[green]✓ Downloaded {dest.name}[/green]")
+    return dest
+
+
+def resume_incomplete_download(item: dict) -> Path:
+    state, part_path = item["state"], item["part_path"]
+    dest = Path(state["dest"])
+    session = _ms_download_session(state["slug"])
+
+    try:
+        download_iso_with_progress(session, state["url"], dest, resume=True)
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else None
+        # Expired signed URLs come back as an edge "Access Denied" — usually 403,
+        # but treat any auth/not-found-shaped status as expired and regenerate.
+        if status not in (400, 401, 403, 404, 410):
+            raise
+        console.print("[yellow]Download link expired — requesting a fresh one from Microsoft...[/yellow]")
+        _ensure_playwright_ready()
+        links = fetch_download_links(
+            state["slug"], state["edition_id"], state["sku_id"],
+            state.get("sku_language_raw", state.get("sku_language")),
+        )
+        chosen = _pick_download_option(links, state.get("option_name"))
+        state["url"] = chosen["Uri"]
+        _write_download_state(part_path, state)
+        download_iso_with_progress(session, state["url"], dest, resume=True)
+
+    console.print(f"[green]✓ Downloaded {dest.name}[/green]")
+    return dest
+
+
+def ask_resume_incomplete_downloads(downloads_dir: Path) -> Path | None:
+    for item in find_incomplete_downloads(downloads_dir):
+        state, part_path = item["state"], item["part_path"]
+        so_far = part_path.stat().st_size
+        label = f"{state.get('entry_name', 'ISO')} ({state.get('sku_language', '?')})"
+        if Confirm.ask(
+            f"Found an incomplete {label} download — {fmt_size(so_far)} saved. Resume it?",
+            default=True,
+        ):
+            try:
+                return resume_incomplete_download(item)
+            except (requests.RequestException, RuntimeError, KeyError, ValueError) as e:
+                console.print(f"[red]Resume failed:[/red] {e}")
+                continue
+        elif Confirm.ask("Discard this incomplete download?", default=False):
+            part_path.unlink(missing_ok=True)
+            item["state_path"].unlink(missing_ok=True)
+    return None
+
+
+def ask_os_and_iso() -> Path:
+    """Top-level flow: resume any interrupted download, otherwise pick an OS
+    and either reuse/download its ISO or fall back to a manual path."""
+    downloads_dir = get_downloads_dir()
+
+    resumed = ask_resume_incomplete_downloads(downloads_dir)
+    if resumed:
+        return resumed
+
+    entry = ask_os_choice()
+
+    if not entry["dynamic"]:
+        if entry["name"] != "I already have an ISO file":
+            console.print(
+                f"\n[yellow]{entry['name']} isn't available as a direct Microsoft download "
+                "anymore.[/yellow] Please download it manually and provide the path below."
+            )
+        return ask_iso_path()
+
+    found = find_existing_isos(entry, downloads_dir)
+    if found:
+        chosen = ask_existing_iso_choice(entry, found)
+        if chosen:
+            return chosen
+
+    if Confirm.ask(f"Download {entry['name']} now from Microsoft?", default=True):
+        try:
+            return download_windows_iso(entry, downloads_dir)
+        except (requests.RequestException, RuntimeError, KeyError, ValueError) as e:
+            console.print(
+                f"[red]Automatic download failed:[/red] {e}\n"
+                "[dim]Microsoft may be rate-limiting this network, or changed their API. "
+                "Download manually from https://www.microsoft.com/software-download/"
+                f"{entry['slug']} and provide the ISO path below.[/dim]"
+            )
+            return ask_iso_path()
+
+    console.print("[dim]Provide the path to an existing ISO instead.[/dim]")
+    return ask_iso_path()
 
 
 # ── ISO ───────────────────────────────────────────────────────────────────────
@@ -308,7 +879,9 @@ def _copy_one(src_file: Path, dst_file: Path):
     return src_file
 
 
-def copy_files_except_wim(src: str, dst: Path):
+def copy_files_except_wim(src: str, dst: Path, progress_cb=None):
+    """progress_cb(done_count, total_count, current_filename) is called after
+    each file when given, instead of drawing the Rich progress bar."""
     src_path = Path(src)
     skip = {src_path / "sources" / "install.wim", src_path / "sources" / "install.esd"}
     files = [p for p in src_path.rglob("*") if p.is_file() and p not in skip]
@@ -319,15 +892,29 @@ def copy_files_except_wim(src: str, dst: Path):
     for d in {(dst / f.relative_to(src_path)).parent for f in files}:
         d.mkdir(parents=True, exist_ok=True)
 
-    console.print("\n[dim]Copying boot files...[/dim]")
-    with Progress(
-        TextColumn("[cyan]{task.fields[filename]}[/cyan]", justify="left",
-                   table_column=Column(width=35, no_wrap=True)),
-        BarColumn(),
-        MofNCompleteColumn(),
-        console=console,
-    ) as progress:
-        task = progress.add_task("copy", total=len(files), filename="")
+    if progress_cb is None:
+        console.print("\n[dim]Copying boot files...[/dim]")
+        with Progress(
+            TextColumn("[cyan]{task.fields[filename]}[/cyan]", justify="left",
+                       table_column=Column(width=35, no_wrap=True)),
+            BarColumn(),
+            MofNCompleteColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task("copy", total=len(files), filename="")
+            with ThreadPoolExecutor(max_workers=_COPY_WORKERS) as pool:
+                futures = {
+                    pool.submit(_copy_one, f, dst / f.relative_to(src_path)): f
+                    for f in files
+                }
+                for future in as_completed(futures):
+                    src_file = futures[future]
+                    future.result()  # re-raise any copy error
+                    progress.update(task, filename=src_file.relative_to(src_path).name)
+                    progress.advance(task)
+    else:
+        done = 0
+        progress_cb(done, len(files), "")
         with ThreadPoolExecutor(max_workers=_COPY_WORKERS) as pool:
             futures = {
                 pool.submit(_copy_one, f, dst / f.relative_to(src_path)): f
@@ -336,8 +923,8 @@ def copy_files_except_wim(src: str, dst: Path):
             for future in as_completed(futures):
                 src_file = futures[future]
                 future.result()  # re-raise any copy error
-                progress.update(task, filename=src_file.relative_to(src_path).name)
-                progress.advance(task)
+                done += 1
+                progress_cb(done, len(files), src_file.relative_to(src_path).name)
 
 
 def split_and_copy_wim(wim_path: Path, dst: Path):
@@ -351,24 +938,37 @@ def split_and_copy_wim(wim_path: Path, dst: Path):
         capture=False)
 
 
-def copy_wim_direct(wim_path: Path, dst: Path):
+def copy_wim_direct(wim_path: Path, dst: Path, progress_cb=None):
+    """progress_cb(bytes_done, total_bytes) is called per chunk when given,
+    instead of drawing the Rich progress bar."""
     dst_dir = dst / "sources"
     dst_dir.mkdir(parents=True, exist_ok=True)
     dst_file = dst_dir / wim_path.name
     size = wim_path.stat().st_size
     chunk = 4 * 1024 * 1024  # 4 MB — good balance for USB sequential write
 
-    console.print(f"\n[dim]Copying {wim_path.name} ({fmt_size(size)})...[/dim]")
-    with Progress(
-        TextColumn("[cyan]{task.fields[filename]}[/cyan]",
-                   table_column=Column(width=35, no_wrap=True)),
-        BarColumn(),
-        FileSizeColumn(),
-        TransferSpeedColumn(),
-        TimeRemainingColumn(),
-        console=console,
-    ) as progress:
-        task = progress.add_task("wim", total=size, filename=wim_path.name)
+    if progress_cb is None:
+        console.print(f"\n[dim]Copying {wim_path.name} ({fmt_size(size)})...[/dim]")
+        with Progress(
+            TextColumn("[cyan]{task.fields[filename]}[/cyan]",
+                       table_column=Column(width=35, no_wrap=True)),
+            BarColumn(),
+            FileSizeColumn(),
+            TransferSpeedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task("wim", total=size, filename=wim_path.name)
+            with open(wim_path, "rb") as fsrc, open(dst_file, "wb") as fdst:
+                in_fd, out_fd, offset = fsrc.fileno(), fdst.fileno(), 0
+                while offset < size:
+                    sent = os.sendfile(out_fd, in_fd, offset, min(chunk, size - offset))
+                    if sent == 0:
+                        break
+                    offset += sent
+                    progress.advance(task, sent)
+    else:
+        progress_cb(0, size)
         with open(wim_path, "rb") as fsrc, open(dst_file, "wb") as fdst:
             in_fd, out_fd, offset = fsrc.fileno(), fdst.fileno(), 0
             while offset < size:
@@ -376,7 +976,7 @@ def copy_wim_direct(wim_path: Path, dst: Path):
                 if sent == 0:
                     break
                 offset += sent
-                progress.advance(task, sent)
+                progress_cb(offset, size)
     shutil.copystat(wim_path, dst_file)
 
 
@@ -399,8 +999,13 @@ def main():
     log.info("macos-rufus started")
     check_deps()
 
-    # 1. ISO path
-    iso_path = ask_iso_path()
+    # 1. Pick OS + get ISO (download fresh, reuse a managed download, or supply a path)
+    try:
+        iso_path = ask_os_and_iso()
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted.[/yellow]")
+        log.warning("Interrupted by user during OS/ISO selection")
+        sys.exit(1)
     log.info("ISO: %s", iso_path)
 
     # 2. USB selection
