@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -826,7 +827,7 @@ def write_windows_vbr(disk_node: str, iso_mount: str):
     if not bootsect.exists():
         console.print(
             "[yellow]boot/bootsect.dat not found in ISO — skipping VBR write.[/yellow]\n"
-            "[dim]Legacy BIOS boot (Win7) may not work.[/dim]"
+            "[dim]Normal for Windows 8.1+ ISOs — UEFI boot is unaffected; only Legacy BIOS boot may not work.[/dim]"
         )
         return
 
@@ -927,15 +928,137 @@ def copy_files_except_wim(src: str, dst: Path, progress_cb=None):
                 progress_cb(done, len(files), src_file.relative_to(src_path).name)
 
 
-def split_and_copy_wim(wim_path: Path, dst: Path):
-    """Split install.wim into ≤3800 MB chunks (FAT32 safe) via wimlib."""
+_WIM_PCT_RE = re.compile(r"\((\d+)%\)")
+_WIM_PART_MB = 3800  # FAT32-safe part size
+_WIM_ERR_UNSUPPORTED = 68  # WIMLIB_ERR_UNSUPPORTED — e.g. splitting a solid (LZMS) WIM
+
+
+def _run_wimlib(cmd: list[str], progress_cb=None) -> tuple[int, str]:
+    """Run a wimlib-imagex command, streaming its \\r-updated progress output.
+
+    progress_cb(percent) is called whenever wimlib reports a new percentage.
+    Returns (exit_code, tail_of_output).
+    """
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, bufsize=1)
+    tail: list[str] = []
+    buf = ""
+    last_pct = -1
+
+    def flush(line: str):
+        nonlocal last_pct
+        m = _WIM_PCT_RE.search(line)
+        if m:
+            pct = int(m.group(1))
+            if pct != last_pct and progress_cb:
+                progress_cb(pct)
+            last_pct = pct
+        elif line.strip():
+            tail.append(line.strip())
+            del tail[:-10]
+
+    while True:
+        ch = proc.stdout.read(1)
+        if not ch:
+            break
+        if ch in "\r\n":
+            flush(buf)
+            buf = ""
+        else:
+            buf += ch
+    flush(buf)
+    proc.stdout.close()
+    return proc.wait(), "\n".join(tail)
+
+
+def wim_may_be_solid(wim_path: Path) -> bool:
+    """True if the WIM uses LZMS compression (what solid WIMs use).
+
+    Non-solid LZMS WIMs also match, so this is only a hint for pre-flight
+    checks; the authoritative signal is `wimlib-imagex split` failing.
+    """
+    if not shutil.which("wimlib-imagex"):
+        return False
+    res = run(["wimlib-imagex", "info", str(wim_path)], check=False)
+    return re.search(r"^Compression:\s*LZMS", res.stdout, re.M) is not None
+
+
+def check_wim_export_space(wim_path: Path):
+    """Fail early (before the USB is erased) if a solid WIM can't be re-exported."""
+    if wim_path.stat().st_size <= FAT32_LIMIT or not wim_may_be_solid(wim_path):
+        return
+    needed = wim_path.stat().st_size
+    free = shutil.disk_usage(tempfile.gettempdir()).free
+    if free < needed:
+        raise RuntimeError(
+            f"This ISO's install.wim is compressed in a format that must be "
+            f"re-compressed before it fits on FAT32, which needs about "
+            f"{fmt_size(needed)} of free temporary space on this Mac, but only "
+            f"{fmt_size(free)} is free. Free up disk space and try again."
+        )
+
+
+def split_and_copy_wim(wim_path: Path, dst: Path, progress_cb=None):
+    """Split install.wim into <=3800 MB chunks (FAT32 safe) via wimlib.
+
+    Windows 11 24H2+ ISOs ship a solid (LZMS) WIM which wimlib cannot split.
+    In that case it is first exported to a non-solid WIM in a temp dir, then split.
+
+    progress_cb(phase, percent) is called during long steps; when None, a Rich
+    progress bar is drawn instead.
+    """
     if not shutil.which("wimlib-imagex"):
         raise RuntimeError("wimlib-imagex missing. Run: brew install wimlib")
     out_dir = dst / "sources"
     out_dir.mkdir(parents=True, exist_ok=True)
-    console.print(f"\n[yellow]install.wim > 4 GiB — splitting into .swm chunks...[/yellow]")
-    run(["wimlib-imagex", "split", str(wim_path), str(out_dir / "install.swm"), "3800"],
-        capture=False)
+    target = out_dir / "install.swm"
+
+    if progress_cb is None:
+        console.print("\n[yellow]install.wim > 4 GiB — splitting into .swm chunks...[/yellow]")
+        progress = Progress(TextColumn("[cyan]{task.description}[/cyan]"),
+                            BarColumn(), TextColumn("{task.percentage:>3.0f}%"),
+                            console=console)
+        task = progress.add_task("", total=100)
+
+        def cb(phase, pct):
+            progress.update(task, description=phase, completed=pct)
+
+        with progress:
+            _split_wim(wim_path, target, cb)
+    else:
+        _split_wim(wim_path, target, progress_cb)
+
+
+def _split_wim(wim_path: Path, target: Path, cb):
+    def cleanup_parts():
+        for f in target.parent.glob("install*.swm"):
+            f.unlink(missing_ok=True)
+
+    cb("Splitting", 0)
+    code, out = _run_wimlib(["wimlib-imagex", "split", str(wim_path), str(target), str(_WIM_PART_MB)],
+                            lambda p: cb("Splitting", p))
+    if code == 0:
+        return
+    if code != _WIM_ERR_UNSUPPORTED:
+        cleanup_parts()
+        raise RuntimeError(f"wimlib-imagex split failed (exit {code}):\n{out}")
+
+    log.info("WIM is solid — exporting to non-solid before splitting")
+    cleanup_parts()
+    with tempfile.TemporaryDirectory(prefix="macos-rufus-") as tmp:
+        flat = Path(tmp) / "install.wim"
+        cb("Re-compressing (solid WIM)", 0)
+        code, out = _run_wimlib(
+            ["wimlib-imagex", "export", str(wim_path), "all", str(flat), "--compress=LZX"],
+            lambda p: cb("Re-compressing (solid WIM)", p))
+        if code != 0:
+            raise RuntimeError(f"wimlib-imagex export failed (exit {code}):\n{out}")
+        cb("Splitting", 0)
+        code, out = _run_wimlib(["wimlib-imagex", "split", str(flat), str(target), str(_WIM_PART_MB)],
+                                lambda p: cb("Splitting", p))
+        if code != 0:
+            cleanup_parts()
+            raise RuntimeError(f"wimlib-imagex split failed (exit {code}):\n{out}")
 
 
 def copy_wim_direct(wim_path: Path, dst: Path, progress_cb=None):
@@ -1038,6 +1161,11 @@ def main():
         iso_info = detect_iso(mount_point)
         log.info("ISO type: uefi=%s bootsect=%s win7era=%s",
                  iso_info["uefi"], iso_info["has_bootsect"], iso_info["is_win7_era"])
+
+        # 4b. Pre-flight: make sure a solid WIM can be re-exported before we erase anything
+        preflight_wim = get_wim_path(mount_point)
+        if preflight_wim:
+            check_wim_export_space(preflight_wim)
 
         # 5. Format USB
         run(["diskutil", "unmountDisk", disk_node], check=False)

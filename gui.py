@@ -685,6 +685,9 @@ class FlashPage(QWidget):
             done, total = data.get("done", 0), data.get("total", 1)
             self.bar.setValue(int(done * 100 / total) if total else 0)
             self.detail_label.setText(f"{done}/{total} files — {data.get('filename', '')}")
+        elif stage == "copy_wim" and status == "progress" and "percent" in data:
+            self.bar.setValue(int(data["percent"]))
+            self.detail_label.setText(f"{data.get('phase', '')} — {data['percent']}%")
         elif stage == "copy_wim" and status == "progress":
             done, total = data.get("done", 0), data.get("total", 1)
             self.bar.setValue(int(done * 100 / total) if total else 0)
