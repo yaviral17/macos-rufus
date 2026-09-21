@@ -256,6 +256,8 @@ FAT32 has a hard per-file limit of 4,294,967,295 bytes (~4 GiB). Windows 11's `i
 
 **macos-rufus** detects this automatically and uses `wimlib-imagex split` to break the WIM into 3,800 MB chunks (`install.swm`, `install2.swm`, …). The Windows installer natively reassembles split WIM files — no extra steps on the target machine.
 
+Newer Windows 11 ISOs (24H2+) store `install.wim` as a *solid* WIM, which wimlib cannot split directly. In that case macos-rufus first re-exports it to a regular (LZX) WIM in a temporary folder, then splits it. This takes a few extra minutes and needs free space on your Mac roughly equal to the size of `install.wim` — it is checked before the USB is erased.
+
 ### Windows 7 legacy BIOS boot — the VBR problem
 
 This is what breaks every other "copy files to USB" approach for Windows 7:
@@ -339,7 +341,8 @@ Download official ISOs directly from Microsoft:
 ### "install.wim splitting fails"
 
 - Run `brew install wimlib` manually and retry
-- Check free disk space — the split writes chunks to the USB as it goes
+- Check free disk space — the split writes chunks to the USB as it goes, and solid WIMs (Win 11 24H2+) need temporary space on your Mac too
+- Garbled box-drawing characters (`â macos-rufus â`) mean your terminal isn't using UTF-8; run `export LANG=en_US.UTF-8` first
 
 ### "USB not booting on target machine"
 

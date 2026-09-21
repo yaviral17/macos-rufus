@@ -47,6 +47,9 @@ def main():
         emit(progress_file, stage="mount", status="start")
         mount_point = rufus.mount_iso(iso_path)
         iso_info = rufus.detect_iso(mount_point)
+        preflight_wim = rufus.get_wim_path(mount_point)
+        if preflight_wim:
+            rufus.check_wim_export_space(preflight_wim)
         emit(progress_file, stage="mount", status="done", uefi=iso_info["uefi"])
 
         emit(progress_file, stage="format", status="start")
@@ -77,7 +80,13 @@ def main():
         if wim_path:
             if wim_path.stat().st_size > rufus.FAT32_LIMIT:
                 emit(progress_file, stage="copy_wim", status="start", split=True)
-                rufus.split_and_copy_wim(wim_path, usb_volume)
+                rufus.split_and_copy_wim(
+                    wim_path, usb_volume,
+                    progress_cb=lambda phase, pct: emit(
+                        progress_file, stage="copy_wim", status="progress",
+                        phase=phase, percent=pct,
+                    ),
+                )
                 emit(progress_file, stage="copy_wim", status="done", split=True)
             else:
                 emit(progress_file, stage="copy_wim", status="start", split=False,
