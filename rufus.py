@@ -100,15 +100,104 @@ def check_deps():
 # ── OS catalog & ISO download ────────────────────────────────────────────────
 
 # Microsoft only exposes the "no Media Creation Tool" ISO download API for
-# Windows 10 and 11. Older versions require a product key / retired download
-# pages, so those stay manual-path-only.
+# Windows 10 and 11 ("dynamic"). Windows 7 / 8.1 are fetched from fixed
+# archive.org URLs ("direct"). Anything else is manual-path-only.
 OS_CATALOG = [
     {"name": "Windows 11", "slug": "windows11", "dynamic": True},
     {"name": "Windows 10", "slug": "windows10ISO", "dynamic": True},
-    {"name": "Windows 8.1", "slug": None, "dynamic": False},
-    {"name": "Windows 7", "slug": None, "dynamic": False},
+    {"name": "Windows 8.1", "slug": None, "dynamic": False, "direct": [
+        {"label": "64-bit (x64)", "arch": "x64",
+         "url": "https://archive.org/download/win-8.1-english-x-64_20211019/Win8.1_English_x64.iso"},
+        {"label": "32-bit (x86)", "arch": "x86",
+         "url": "https://archive.org/download/win-8.1-english-x-64_20211019/Win8.1_English_x32.iso"},
+    ]},
+    {"name": "Windows 7", "slug": None, "dynamic": False, "direct": [
+        {"label": "Professional 32-bit (x86)", "arch": "x86",
+         "url": "https://archive.org/download/windows-7-iso-/Win7Pro32bit.iso"},
+    ]},
+    {"name": "Ubuntu", "slug": None, "dynamic": False, "linux": True, "direct": [
+        {"label": "24.04 LTS Desktop (64-bit)", "tag": "lts-desktop-amd64",
+         "resolver": "_resolve_ubuntu"},
+    ]},
+    {"name": "Arch Linux", "slug": None, "dynamic": False, "linux": True, "direct": [
+        {"label": "Latest (64-bit)", "tag": "latest-x86_64",
+         "url": "https://geo.mirror.pkgbuild.com/iso/latest/archlinux-x86_64.iso"},
+    ]},
+    {"name": "Kali Linux", "slug": None, "dynamic": False, "linux": True, "direct": [
+        {"label": "Installer (64-bit)", "tag": "installer-amd64",
+         "resolver": "_resolve_kali_installer"},
+    ]},
+    {"name": "Pop!_OS", "slug": None, "dynamic": False, "linux": True, "direct": [
+        {"label": "24.04 — Intel/AMD graphics", "tag": "24.04-intel", "resolver": "_resolve_pop_2404_intel"},
+        {"label": "24.04 — NVIDIA graphics", "tag": "24.04-nvidia", "resolver": "_resolve_pop_2404_nvidia"},
+        {"label": "22.04 — Intel/AMD graphics", "tag": "22.04-intel", "resolver": "_resolve_pop_2204_intel"},
+        {"label": "22.04 — NVIDIA graphics", "tag": "22.04-nvidia", "resolver": "_resolve_pop_2204_nvidia"},
+    ]},
+    {"name": "Omarchy", "slug": None, "dynamic": False, "linux": True, "direct": [
+        {"label": "Latest (64-bit)", "tag": "latest-x86_64", "resolver": "_resolve_omarchy"},
+    ]},
     {"name": "I already have an ISO file", "slug": None, "dynamic": False},
 ]
+
+
+def direct_filename(entry: dict, option: dict) -> str:
+    """Matches the prefix find_existing_isos() globs for."""
+    prefix = entry['name'].replace(' ', '').replace('.', '').replace('!', '')
+    return f"{prefix}_{option.get('tag') or 'en-us_' + option['arch']}.iso"
+
+
+def _scrape_latest(index_url: str, pattern: str) -> str:
+    """Newest href in an HTTP directory listing matching `pattern` (a regex).
+    Distros rename ISOs every point release, so links can't be hard-coded."""
+    resp = requests.get(index_url, timeout=30, headers={"User-Agent": _DOWNLOAD_UA})
+    resp.raise_for_status()
+    names = sorted(set(re.findall(pattern, resp.text)),
+                   key=lambda n: [int(x) for x in re.findall(r"\d+", n)])
+    if not names:
+        raise RuntimeError(f"No ISO matching {pattern!r} found at {index_url}")
+    return names[-1]
+
+
+def _resolve_ubuntu() -> str:
+    base = "https://releases.ubuntu.com/noble/"
+    return base + _scrape_latest(base, r'href="(ubuntu-[\d.]+-desktop-amd64\.iso)"')
+
+
+def _resolve_kali_installer() -> str:
+    base = "https://cdimage.kali.org/current/"
+    return base + _scrape_latest(base, r'href="(kali-linux-[\d.]+-installer-amd64\.iso)"')
+
+
+def _resolve_pop(version: str, channel: str) -> str:
+    resp = requests.get(f"https://api.pop-os.org/builds/{version}/{channel}?arch=amd64", timeout=30)
+    resp.raise_for_status()
+    return resp.json()["url"]
+
+
+def _resolve_pop_2404_intel() -> str:  return _resolve_pop("24.04", "intel")
+def _resolve_pop_2404_nvidia() -> str: return _resolve_pop("24.04", "nvidia")
+def _resolve_pop_2204_intel() -> str:  return _resolve_pop("22.04", "intel")
+def _resolve_pop_2204_nvidia() -> str: return _resolve_pop("22.04", "nvidia")
+
+
+def _resolve_omarchy() -> str:
+    resp = requests.get("https://omarchy.org", timeout=30, headers={"User-Agent": _DOWNLOAD_UA})
+    resp.raise_for_status()
+    m = re.search(r"https://iso\.omarchy\.org/omarchy-[\d.]+\.iso", resp.text)
+    if not m:
+        raise RuntimeError("Couldn't find the Omarchy ISO link on omarchy.org")
+    return m.group(0)
+
+
+def resolve_option_url(option: dict) -> str:
+    """Fixed URL, or one looked up at download time by the named resolver."""
+    return option.get("url") or globals()[option["resolver"]]()
+
+
+def _plain_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({"User-Agent": _DOWNLOAD_UA})
+    return s
 
 # Spoofing a non-Windows browser is required — Microsoft's download API
 # redirects real Windows user agents to the Media Creation Tool instead of
@@ -454,7 +543,8 @@ def ask_os_choice() -> dict:
     t.add_column("Auto-download")
     for i, entry in enumerate(OS_CATALOG, 1):
         t.add_row(str(i), entry["name"],
-                   "[green]Yes[/green]" if entry["dynamic"] else "[dim]No — manual ISO only[/dim]")
+                   "[green]Yes[/green]" if entry["dynamic"] or entry.get("direct")
+                   else "[dim]No — manual ISO only[/dim]")
     console.print()
     console.print(t)
 
@@ -470,8 +560,11 @@ def ask_os_choice() -> dict:
 
 
 def ask_existing_iso_choice(entry: dict, found: list[Path]) -> Path | None:
-    """If matching ISOs already sit in the managed downloads folder, offer to
-    reuse one instead of downloading again."""
+    """Reuse an ISO already in the managed downloads folder. A single match is
+    picked automatically; with several, the newest is the default."""
+    if len(found) == 1:
+        console.print(f"\n[green]✓ Found existing {entry['name']} ISO[/green] — using {found[0].name}")
+        return found[0]
     t = Table(title=f"Existing {entry['name']} ISOs found", show_lines=True)
     t.add_column("#", style="bold cyan", width=3)
     t.add_column("File")
@@ -483,20 +576,17 @@ def ask_existing_iso_choice(entry: dict, found: list[Path]) -> Path | None:
                    datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"))
     console.print()
     console.print(t)
-
-    if not Confirm.ask("Use one of these instead of downloading again?", default=True):
-        return None
-    if len(found) == 1:
-        return found[0]
     while True:
-        raw = Prompt.ask("[bold cyan]Select file number[/bold cyan]")
+        raw = Prompt.ask("[bold cyan]Select file number (0 to download a new one)[/bold cyan]", default="1")
         try:
-            idx = int(raw) - 1
-            if 0 <= idx < len(found):
-                return found[idx]
+            idx = int(raw)
+            if idx == 0:
+                return None
+            if 1 <= idx <= len(found):
+                return found[idx - 1]
         except ValueError:
             pass
-        console.print(f"[red]Enter 1–{len(found)}.[/red]")
+        console.print(f"[red]Enter 0–{len(found)}.[/red]")
 
 
 def download_windows_iso(entry: dict, downloads_dir: Path) -> Path:
@@ -575,9 +665,50 @@ def download_windows_iso(entry: dict, downloads_dir: Path) -> Path:
     return dest
 
 
+def download_direct_iso(entry: dict, downloads_dir: Path) -> Path:
+    options = entry["direct"]
+    if len(options) == 1:
+        chosen = options[0]
+    else:
+        t = Table(title="Select Download", show_lines=True)
+        t.add_column("#", style="bold cyan", width=3)
+        t.add_column("Option")
+        for i, o in enumerate(options, 1):
+            t.add_row(str(i), o["label"])
+        console.print()
+        console.print(t)
+        while True:
+            raw = Prompt.ask("[bold cyan]Select download option number[/bold cyan]")
+            try:
+                idx = int(raw) - 1
+                if 0 <= idx < len(options):
+                    chosen = options[idx]
+                    break
+            except ValueError:
+                pass
+            console.print(f"[red]Enter 1–{len(options)}.[/red]")
+
+    dest = downloads_dir / direct_filename(entry, chosen)
+    console.print(f"[dim]Looking up the latest {entry['name']} ISO...[/dim]")
+    url = resolve_option_url(chosen)
+    state = {
+        "entry_name": entry["name"], "direct": True, "sku_language": chosen["label"],
+        "url": url, "dest": str(dest), "created": datetime.now().isoformat(),
+    }
+    _write_download_state(dest.with_suffix(".iso.part"), state)
+    console.print(f"[green]✓ Saving {chosen['label']}[/green] to {dest}")
+    download_iso_with_progress(_plain_session(), url, dest)
+    console.print(f"[green]✓ Downloaded {dest.name}[/green]")
+    return dest
+
+
 def resume_incomplete_download(item: dict) -> Path:
     state, part_path = item["state"], item["part_path"]
     dest = Path(state["dest"])
+    if state.get("direct"):
+        download_iso_with_progress(_plain_session(), state["url"], dest, resume=True)
+        console.print(f"[green]✓ Downloaded {dest.name}[/green]")
+        return dest
     session = _ms_download_session(state["slug"])
 
     try:
@@ -603,50 +734,73 @@ def resume_incomplete_download(item: dict) -> Path:
     return dest
 
 
-def ask_resume_incomplete_downloads(downloads_dir: Path) -> Path | None:
+def incomplete_for_entry(entry: dict, downloads_dir: Path) -> list[dict]:
+    """Interrupted downloads belonging to this OS, newest first. A partial whose
+    finished ISO already exists is stale and gets cleaned up."""
+    items = []
     for item in find_incomplete_downloads(downloads_dir):
-        state, part_path = item["state"], item["part_path"]
-        so_far = part_path.stat().st_size
-        label = f"{state.get('entry_name', 'ISO')} ({state.get('sku_language', '?')})"
-        if Confirm.ask(
-            f"Found an incomplete {label} download — {fmt_size(so_far)} saved. Resume it?",
-            default=True,
-        ):
-            try:
-                return resume_incomplete_download(item)
-            except (requests.RequestException, RuntimeError, KeyError, ValueError) as e:
-                console.print(f"[red]Resume failed:[/red] {e}")
-                continue
-        elif Confirm.ask("Discard this incomplete download?", default=False):
-            part_path.unlink(missing_ok=True)
+        state = item["state"]
+        if state.get("entry_name") != entry["name"]:
+            continue
+        if Path(state.get("dest", "")).exists():
+            item["part_path"].unlink(missing_ok=True)
             item["state_path"].unlink(missing_ok=True)
+            continue
+        items.append(item)
+    return sorted(items, key=lambda i: i["part_path"].stat().st_mtime, reverse=True)
+
+
+def auto_resume_downloads(entry: dict, downloads_dir: Path) -> Path | None:
+    """Pick up a half-finished download for this OS where it left off."""
+    for item in incomplete_for_entry(entry, downloads_dir):
+        state, part_path = item["state"], item["part_path"]
+        console.print(
+            f"\n[yellow]Found an incomplete {entry['name']} download[/yellow] "
+            f"({state.get('sku_language', '?')}, {fmt_size(part_path.stat().st_size)} saved) — resuming..."
+        )
+        try:
+            return resume_incomplete_download(item)
+        except (requests.RequestException, RuntimeError, KeyError, ValueError) as e:
+            console.print(f"[red]Resume failed:[/red] {e}")
     return None
 
 
 def ask_os_and_iso() -> Path:
-    """Top-level flow: resume any interrupted download, otherwise pick an OS
-    and either reuse/download its ISO or fall back to a manual path."""
+    """Top-level flow: pick an OS, then automatically resume its interrupted
+    download or reuse a finished one; otherwise download it or fall back to a
+    manual path."""
     downloads_dir = get_downloads_dir()
 
-    resumed = ask_resume_incomplete_downloads(downloads_dir)
-    if resumed:
-        return resumed
-
     entry = ask_os_choice()
+    downloadable = entry["dynamic"] or entry.get("direct")
+
+    if downloadable:
+        resumed = auto_resume_downloads(entry, downloads_dir)
+        if resumed:
+            return resumed
+        found = find_existing_isos(entry, downloads_dir)
+        if found:
+            chosen = ask_existing_iso_choice(entry, found)
+            if chosen:
+                return chosen
+
+    if entry.get("direct"):
+        source = "the official mirror" if entry.get("linux") else "archive.org"
+        if Confirm.ask(f"Download {entry['name']} now from {source}?", default=True):
+            try:
+                return download_direct_iso(entry, downloads_dir)
+            except (requests.RequestException, RuntimeError, KeyError, OSError) as e:
+                console.print(f"[red]Download failed:[/red] {e}")
+        console.print("[dim]Provide the path to an existing ISO instead.[/dim]")
+        return ask_iso_path()
 
     if not entry["dynamic"]:
         if entry["name"] != "I already have an ISO file":
             console.print(
-                f"\n[yellow]{entry['name']} isn't available as a direct Microsoft download "
-                "anymore.[/yellow] Please download it manually and provide the path below."
+                f"\n[yellow]{entry['name']} isn't available as a direct download.[/yellow] "
+                "Please download it manually and provide the path below."
             )
         return ask_iso_path()
-
-    found = find_existing_isos(entry, downloads_dir)
-    if found:
-        chosen = ask_existing_iso_choice(entry, found)
-        if chosen:
-            return chosen
 
     if Confirm.ask(f"Download {entry['name']} now from Microsoft?", default=True):
         try:
@@ -668,7 +822,7 @@ def ask_os_and_iso() -> Path:
 
 def ask_iso_path() -> Path:
     while True:
-        raw = Prompt.ask("\n[bold cyan]Path to Windows ISO[/bold cyan]").strip().strip("'\"")
+        raw = Prompt.ask("\n[bold cyan]Path to ISO file[/bold cyan]").strip().strip("'\"")
         p = Path(raw).expanduser().resolve()
         if not p.exists():
             console.print(f"[red]Not found:[/red] {p}")
@@ -723,6 +877,176 @@ def detect_iso(mount_point: str) -> dict:
         )
 
     return {"uefi": has_uefi, "has_bootsect": has_bootsect, "is_win7_era": is_win7_era}
+
+
+# ── ISO probing (Windows vs Linux) ───────────────────────────────────────────
+
+def _is_hybrid_iso(iso: Path) -> bool:
+    """True if the ISO is an isohybrid image — i.e. the first sector is a valid
+    MBR (0x55AA) that also carries boot code or partition entries. Such images
+    boot from USB when written raw (dd), on both BIOS and UEFI."""
+    with open(iso, "rb") as f:
+        sector = f.read(512)
+    if len(sector) < 512 or sector[510:512] != b"\x55\xaa":
+        return False
+    has_code = any(sector[:446])
+    has_parts = any(sector[446:510])
+    return has_code or has_parts
+
+
+def probe_iso(iso: Path) -> dict:
+    """Quietly mount the ISO and classify it. Returns
+    {kind: windows|linux|unknown, hybrid, uefi, label, size}."""
+    mount_point = mount_iso(iso)
+    try:
+        mp = Path(mount_point)
+        is_windows = (mp / "bootmgr").exists() or (mp / "sources" / "install.wim").exists() \
+            or (mp / "sources" / "install.esd").exists()
+        has_uefi = any((mp / "EFI" / "BOOT" / n).exists() or (mp / "efi" / "boot" / n).exists()
+                       for n in ("BOOTx64.EFI", "bootx64.efi", "BOOTX64.EFI"))
+        linux_markers = ("casper", "live", "arch", "isolinux", "syslinux", "boot/grub",
+                         "loader/entries", "LiveOS", "boot/syslinux")
+        is_linux = not is_windows and any((mp / m).exists() for m in linux_markers)
+        return {
+            "kind": "windows" if is_windows else "linux" if is_linux else "unknown",
+            "hybrid": _is_hybrid_iso(iso),
+            "uefi": has_uefi,
+            "label": mp.name,
+            "size": iso.stat().st_size,
+        }
+    finally:
+        unmount_iso(mount_point)
+
+
+def ask_linux_options(info: dict, disk_size: int) -> dict:
+    """Interactive Rufus-style settings for a Linux ISO."""
+    console.print()
+    t = Table(title="Linux ISO detected", box=None, padding=(0, 2))
+    t.add_column(style="dim")
+    t.add_column(style="bold")
+    t.add_row("Volume label", info["label"])
+    t.add_row("Size", fmt_size(info["size"]))
+    t.add_row("Hybrid (raw-writable)", "[green]Yes[/green]" if info["hybrid"] else "[yellow]No[/yellow]")
+    t.add_row("UEFI boot files", "[green]Yes[/green]" if info["uefi"] else "[yellow]Not found[/yellow]")
+    console.print(t)
+
+    opts = {"mode": "copy", "scheme": "MBR", "label": _fat_label(info["label"]), "verify": False}
+
+    if info["hybrid"]:
+        console.print(
+            "\n[bold]Live bootable USB[/bold] — writes the ISO to the drive exactly as-is (\"DD mode\"). "
+            "Boots on both BIOS and UEFI machines and works for live sessions and installers."
+        )
+        if Confirm.ask("Create a live bootable USB this way?", default=True):
+            opts["mode"] = "dd"
+        else:
+            console.print("[dim]Falling back to file-copy mode (UEFI only).[/dim]")
+    elif not info["uefi"]:
+        raise RuntimeError(
+            "This ISO isn't hybrid and has no UEFI boot files, so it can't be made bootable "
+            "from macOS. Try a different ISO image."
+        )
+    else:
+        console.print("\n[yellow]This ISO isn't a hybrid image[/yellow] — using file-copy mode (UEFI boot only).")
+
+    if opts["mode"] == "dd":
+        if disk_size and info["size"] > disk_size:
+            raise RuntimeError(f"ISO ({fmt_size(info['size'])}) is larger than the drive ({fmt_size(disk_size)}).")
+        opts["verify"] = Confirm.ask("Verify the drive after writing? (slower, catches bad sticks)", default=False)
+    else:
+        console.print("\n[bold]Advanced settings[/bold]")
+        opts["scheme"] = Prompt.ask("Partition scheme", choices=["MBR", "GPT"], default="MBR")
+        console.print("[dim]Some distros (e.g. Arch) locate their files by volume label — keep the default unless you know otherwise.[/dim]")
+        opts["label"] = _fat_label(Prompt.ask("Volume label (max 11 chars)", default=opts["label"]))
+    return opts
+
+
+def _fat_label(label: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_ -]", "_", label).upper().strip()
+    return (cleaned or "LINUXUSB")[:11]
+
+
+# ── Linux flashing ────────────────────────────────────────────────────────────
+
+_DD_CHUNK = 4 * 1024 * 1024  # multiple of 512 — required for raw device writes
+
+
+def dd_write_iso(iso: Path, disk_node: str, progress_cb=None, verify: bool = False, verify_cb=None):
+    """Raw-write an isohybrid ISO to the whole disk (like `dd bs=4m`).
+
+    progress_cb(done_bytes, total_bytes); verify_cb(done_bytes, total_bytes).
+    """
+    raw = disk_node.replace("/dev/disk", "/dev/rdisk")
+    total = iso.stat().st_size
+    run(["diskutil", "unmountDisk", "force", disk_node], check=False)
+
+    rich_progress = None
+    if progress_cb is None:
+        rich_progress = Progress(
+            TextColumn("[cyan]{task.description}[/cyan]", table_column=Column(width=12, no_wrap=True)),
+            BarColumn(), FileSizeColumn(), TransferSpeedColumn(), TimeRemainingColumn(), console=console)
+        rich_progress.start()
+        task = rich_progress.add_task("Writing", total=total)
+        progress_cb = lambda done, _t: rich_progress.update(task, completed=done)
+
+    try:
+        done = 0
+        with open(iso, "rb") as src, open(raw, "r+b", buffering=0) as dst:
+            while True:
+                chunk = src.read(_DD_CHUNK)
+                if not chunk:
+                    break
+                if len(chunk) % 512:
+                    chunk += b"\0" * (512 - len(chunk) % 512)
+                dst.write(chunk)
+                done += min(len(chunk), total - done)
+                progress_cb(done, total)
+            os.fsync(dst.fileno())
+    finally:
+        if rich_progress:
+            rich_progress.stop()
+
+    if verify:
+        log.info("Verifying %s", disk_node)
+        done = 0
+        if rich_progress is not None:
+            console.print("[dim]Verifying...[/dim]")
+        with open(iso, "rb") as src, open(raw, "rb", buffering=0) as dst:
+            while True:
+                want = src.read(_DD_CHUNK)
+                if not want:
+                    break
+                got = dst.read(len(want) + (-len(want) % 512))[:len(want)]
+                if got != want:
+                    raise RuntimeError(f"Verification failed near byte {done} — the drive may be faulty.")
+                done += len(want)
+                if verify_cb:
+                    verify_cb(done, total)
+        if rich_progress is not None:
+            console.print("[green]✓ Verified[/green]")
+    run(["diskutil", "unmountDisk", "force", disk_node], check=False)
+
+
+def linux_copy_to_usb(iso_mount: str, disk_node: str, scheme: str, label: str, progress_cb=None):
+    """File-copy mode for non-hybrid Linux ISOs: FAT32, UEFI boot only."""
+    if scheme not in ("MBR", "GPT"):
+        raise ValueError(f"bad partition scheme {scheme!r}")
+    fmt = "MBRFormat" if scheme == "MBR" else "GPTFormat"
+    run(["diskutil", "unmountDisk", disk_node], check=False)
+    log.info("Formatting %s as FAT32 %s label=%s", disk_node, scheme, label)
+    run(["diskutil", "eraseDisk", "FAT32", label, fmt, disk_node], capture=progress_cb is not None)
+
+    part = disk_node + ("s1" if scheme == "MBR" else "s2")  # GPT: s1 is the EFI system partition
+    run(["diskutil", "mount", part], check=False)
+    mp = plistlib.loads(run(["diskutil", "info", "-plist", part]).stdout.encode()).get("MountPoint", "")
+    if not mp:
+        raise RuntimeError(f"No mount point for {part}")
+
+    too_big = [p for p in Path(iso_mount).rglob("*") if p.is_file() and p.stat().st_size > FAT32_LIMIT]
+    if too_big:
+        raise RuntimeError(f"{too_big[0].name} is larger than 4 GiB and can't be stored on FAT32.")
+    copy_files_except_wim(iso_mount, Path(mp), progress_cb=progress_cb)
+    run(["diskutil", "unmountDisk", disk_node], check=False)
 
 
 # ── USB detection ─────────────────────────────────────────────────────────────
@@ -1110,10 +1434,51 @@ def fmt_duration(seconds: float) -> str:
     return f"{m}m {s}s" if m else f"{s}s"
 
 
+def flash_linux_cli(iso_path: Path, selected: dict, probed: dict, opts: dict, log_path):
+    disk_node = selected["node"]
+    start_time = time.monotonic()
+    mount_point = None
+    try:
+        if opts["mode"] == "dd":
+            log.info("DD-writing %s -> %s", iso_path, disk_node)
+            dd_write_iso(iso_path, disk_node, verify=opts["verify"])
+            boot_note = "[green]Live USB — UEFI + Legacy BIOS[/green]"
+        else:
+            mount_point = mount_iso(iso_path)
+            linux_copy_to_usb(mount_point, disk_node, opts["scheme"], opts["label"])
+            boot_note = "[yellow]File-copy mode — UEFI boot only[/yellow]"
+        elapsed = time.monotonic() - start_time
+
+        summary = Table.grid(padding=(0, 2))
+        summary.add_column(style="dim")
+        summary.add_column(style="bold white")
+        summary.add_row("ISO", iso_path.name)
+        summary.add_row("Drive", f"{disk_node}  ({selected['name']}, {fmt_size(selected['size'])})")
+        summary.add_row("Boot mode", boot_note)
+        summary.add_row("Time taken", f"[bold cyan]{fmt_duration(elapsed)}[/bold cyan]")
+        summary.add_row("Log saved", f"[dim]{log_path}[/dim]")
+        console.print()
+        console.print(Panel(
+            Text.assemble(("  Done! ", "bold green"), ("Bootable Linux USB is ready.\n\n", "white")),
+            style="bold green", subtitle="[dim]Safe to unplug[/dim]"))
+        console.print(summary)
+        log.info("Linux flash finished in %.1fs", elapsed)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted — the drive is in an incomplete state.[/yellow]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"\n[bold red]Error:[/bold red] {e}")
+        log.error("Linux flash failed: %s", e, exc_info=True)
+        sys.exit(1)
+    finally:
+        if mount_point:
+            unmount_iso(mount_point)
+
+
 def main():
     console.print(Panel(
-        "[bold white]macos-rufus[/bold white]  —  Windows bootable USB creator",
-        subtitle="macOS · UEFI + Legacy BIOS · Win7/8/8.1/10/11",
+        "[bold white]macos-rufus[/bold white]  —  Windows & Linux bootable USB creator",
+        subtitle="macOS · UEFI + Legacy BIOS · Win7/8/8.1/10/11 · Ubuntu/Arch/Kali/Pop!_OS/Omarchy",
         style="bold blue",
     ))
 
@@ -1140,6 +1505,22 @@ def main():
     disk_node = selected["node"]
     log.info("Target USB: %s (%s, %s)", disk_node, selected["name"], fmt_size(selected["size"]))
 
+    # 2b. Windows or Linux? Linux gets its own settings + write pipeline.
+    try:
+        probed = probe_iso(iso_path)
+        log.info("ISO probe: %s", probed)
+        linux_opts = None
+        if probed["kind"] == "linux":
+            linux_opts = ask_linux_options(probed, selected["size"])
+        elif probed["kind"] == "unknown":
+            console.print("[yellow]Couldn't recognise this ISO as Windows or Linux — trying the Windows flow.[/yellow]")
+    except KeyboardInterrupt:
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[bold red]Error:[/bold red] {e}")
+        log.error("ISO probe failed: %s", e, exc_info=True)
+        sys.exit(1)
+
     # 3. Confirm destructive action
     console.print(
         f"\n[bold red]WARNING:[/bold red] "
@@ -1150,6 +1531,10 @@ def main():
         console.print("Aborted.")
         log.info("User aborted at confirmation.")
         sys.exit(0)
+
+    if linux_opts:
+        flash_linux_cli(iso_path, selected, probed, linux_opts, log_path)
+        return
 
     start_time = time.monotonic()
     mount_point = None

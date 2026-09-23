@@ -11,7 +11,9 @@ Progress is reported by appending one JSON object per line to a file the
 write to the GUI's own stdout.
 
 Usage: rufus_worker.py <args.json> <progress.jsonl>
-    args.json: {"iso_path": "...", "disk_node": "/dev/diskN"}
+    args.json: {"iso_path": "...", "disk_node": "/dev/diskN",
+                "linux": null | {"mode": "dd"|"copy", "scheme": "MBR"|"GPT",
+                                 "label": "...", "verify": bool}}
 """
 
 import json
@@ -28,6 +30,48 @@ def emit(progress_file, **fields):
         f.flush()
 
 
+def flash_linux(iso_path, disk_node, opts, progress_file, log_path, start_time):
+    mount_point = None
+    try:
+        if opts["mode"] == "dd":
+            last = [0.0]
+
+            def throttled(stage):
+                def cb(done, total):
+                    now = time.monotonic()
+                    if done >= total or now - last[0] > 0.25:
+                        last[0] = now
+                        emit(progress_file, stage=stage, status="progress", done=done, total=total)
+                return cb
+
+            emit(progress_file, stage="write", status="start")
+            rufus.dd_write_iso(iso_path, disk_node, progress_cb=throttled("write"),
+                               verify=opts.get("verify", False), verify_cb=throttled("verify"))
+            emit(progress_file, stage="write", status="done")
+            if opts.get("verify"):
+                emit(progress_file, stage="verify", status="done")
+            boot_note = "Live USB — UEFI + Legacy BIOS"
+        else:
+            emit(progress_file, stage="mount", status="start")
+            mount_point = rufus.mount_iso(iso_path)
+            emit(progress_file, stage="mount", status="done")
+            emit(progress_file, stage="copy_files", status="start")
+            rufus.linux_copy_to_usb(
+                mount_point, disk_node, opts["scheme"], opts["label"],
+                progress_cb=lambda done, total, name: emit(
+                    progress_file, stage="copy_files", status="progress",
+                    done=done, total=total, filename=name),
+            )
+            emit(progress_file, stage="copy_files", status="done")
+            boot_note = "File-copy mode — UEFI boot only"
+        emit(progress_file, stage="eject", status="done")
+        elapsed = time.monotonic() - start_time
+        emit(progress_file, stage="complete", boot_note=boot_note, elapsed=elapsed, log_path=str(log_path))
+    finally:
+        if mount_point:
+            rufus.unmount_iso(mount_point)
+
+
 def main():
     if len(sys.argv) != 3:
         print("Usage: rufus_worker.py <args.json> <progress.jsonl>", file=sys.stderr)
@@ -42,6 +86,15 @@ def main():
     rufus.log.info("rufus_worker started for %s -> %s", iso_path, disk_node)
 
     start_time = time.monotonic()
+    if args.get("linux"):
+        try:
+            flash_linux(iso_path, disk_node, args["linux"], progress_file, log_path, start_time)
+        except Exception as e:
+            rufus.log.error("rufus_worker linux fatal error: %s", e, exc_info=True)
+            emit(progress_file, stage="error", message=str(e))
+            sys.exit(1)
+        return
+
     mount_point = None
     try:
         emit(progress_file, stage="mount", status="start")

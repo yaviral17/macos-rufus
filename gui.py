@@ -25,7 +25,7 @@ from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QFileDialog, QGroupBox,
-    QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow,
+    QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
     QMessageBox, QProgressBar, QPushButton, QRadioButton, QStackedWidget,
     QTextEdit, QVBoxLayout, QWidget,
 )
@@ -97,6 +97,8 @@ class DownloadWorker(QThread):
         try:
             if self.mode == "fresh":
                 self._run_fresh()
+            elif self.mode == "direct":
+                self._run_direct()
             else:
                 self._run_resume()
         except KeyboardInterrupt:
@@ -131,6 +133,9 @@ class DownloadWorker(QThread):
         }
         rufus._write_download_state(dest.with_suffix(".iso.part"), state)
 
+        self._download_fresh(session, url, dest)
+
+    def _download_fresh(self, session, url, dest):
         self.status.emit(f"Downloading {dest.name}...")
         rufus.download_iso_with_progress(
             session, url, dest,
@@ -139,11 +144,33 @@ class DownloadWorker(QThread):
         )
         self.finished_ok.emit(str(dest))
 
+    def _run_direct(self):
+        entry, option = self.kwargs["entry"], self.kwargs["option"]
+        dest = self.kwargs["downloads_dir"] / rufus.direct_filename(entry, option)
+        self._dest = dest
+        self.status.emit(f"Looking up the latest {entry['name']} ISO...")
+        url = rufus.resolve_option_url(option)
+        state = {
+            "entry_name": entry["name"], "direct": True, "sku_language": option["label"],
+            "url": url, "dest": str(dest), "created": datetime.now().isoformat(),
+        }
+        rufus._write_download_state(dest.with_suffix(".iso.part"), state)
+        self._download_fresh(rufus._plain_session(), url, dest)
+
     def _run_resume(self):
         item = self.kwargs["item"]
         state, part_path = item["state"], item["part_path"]
         dest = Path(state["dest"])
         self._dest = dest
+        if state.get("direct"):
+            self.status.emit(f"Resuming {dest.name}...")
+            rufus.download_iso_with_progress(
+                rufus._plain_session(), state["url"], dest, resume=True,
+                progress_cb=lambda d, t: self.progress.emit(d, t),
+                should_pause=self._pause_event.is_set,
+            )
+            self.finished_ok.emit(str(dest))
+            return
         session = rufus._ms_download_session(state["slug"])
 
         self.status.emit(f"Resuming {dest.name}...")
@@ -183,17 +210,19 @@ class FlashWorker(QThread):
     finished_ok = Signal(dict)
     error = Signal(str)
 
-    def __init__(self, iso_path: Path, disk_node: str):
+    def __init__(self, iso_path: Path, disk_node: str, linux_opts: dict | None = None):
         super().__init__()
         self.iso_path = iso_path
         self.disk_node = disk_node
+        self.linux_opts = linux_opts
 
     def run(self):
         tmp_dir = Path(tempfile.mkdtemp(prefix="macos-rufus-"))
         args_path = tmp_dir / "args.json"
         progress_path = tmp_dir / "progress.jsonl"
         worker_log = tmp_dir / "worker.log"
-        args_path.write_text(json.dumps({"iso_path": str(self.iso_path), "disk_node": self.disk_node}))
+        args_path.write_text(json.dumps({"iso_path": str(self.iso_path), "disk_node": self.disk_node,
+                                      "linux": self.linux_opts}))
         progress_path.write_text("")
 
         worker_script = Path(__file__).resolve().parent / "rufus_worker.py"
@@ -257,12 +286,13 @@ class OsSelectPage(QWidget):
         title = QLabel("Select an Operating System")
         title.setFont(QFont("", 18, QFont.Bold))
         layout.addWidget(title)
-        layout.addWidget(QLabel("Windows 10/11 can be downloaded automatically. "
-                                 "Other versions need an existing ISO file."))
+        layout.addWidget(QLabel("Windows 7/8.1/10/11 and popular Linux distros can be downloaded automatically. "
+                                 "Anything else needs an existing ISO file."))
 
         self.list = QListWidget()
         for entry in rufus.OS_CATALOG:
-            tag = "Auto-download available" if entry["dynamic"] else "Manual ISO only"
+            tag = ("Auto-download available" if entry["dynamic"] or entry.get("direct")
+                   else "Manual ISO only")
             item = QListWidgetItem(f"{entry['name']}  —  {tag}")
             item.setData(Qt.UserRole, entry)
             self.list.addItem(item)
@@ -337,6 +367,17 @@ class IsoAcquirePage(QWidget):
         dv.addWidget(download_btn)
         self.layout_.addWidget(self.download_box)
 
+        # -- direct (archive.org) download widgets --
+        self.direct_box = QGroupBox("Download")
+        drv = QVBoxLayout(self.direct_box)
+        self.direct_combo = QComboBox()
+        drv.addWidget(QLabel("Version:"))
+        drv.addWidget(self.direct_combo)
+        direct_btn = QPushButton("Download")
+        direct_btn.clicked.connect(self._start_direct_download)
+        drv.addWidget(direct_btn)
+        self.layout_.addWidget(self.direct_box)
+
         self.selected_path = None
 
         btn_row = QHBoxLayout()
@@ -357,12 +398,30 @@ class IsoAcquirePage(QWidget):
         self.title.setText(entry["name"])
         self.downloads_dir = downloads_dir
 
+        self.direct_box.setVisible(False)
+
+        # A half-finished download for this OS picks up where it left off.
+        if entry["dynamic"] or entry.get("direct"):
+            partials = rufus.incomplete_for_entry(entry, downloads_dir)
+            if partials:
+                self.status_label.setText(f"Resuming your interrupted {entry['name']} download...")
+                self.on_start_download(mode="resume", item=partials[0])
+                return
+
         if not entry["dynamic"]:
             self.manual_box.setVisible(True)
             self.existing_box.setVisible(False)
             self.download_box.setVisible(False)
             self.path_label.setText("No file selected")
-            if entry["name"] != "I already have an ISO file":
+            if entry.get("direct"):
+                self._show_existing(rufus.find_existing_isos(entry, downloads_dir))
+                self.direct_combo.clear()
+                for o in entry["direct"]:
+                    self.direct_combo.addItem(o["label"], o)
+                self.direct_box.setVisible(True)
+                if not self.selected_path:
+                    self.status_label.setText("Pick a version to download, or browse for an existing ISO.")
+            elif entry["name"] != "I already have an ISO file":
                 self.status_label.setText(
                     f"{entry['name']} isn't available as a direct Microsoft download anymore. "
                     "Please download it manually and select the file below."
@@ -376,27 +435,42 @@ class IsoAcquirePage(QWidget):
         self.download_box.setVisible(False)
         self.status_label.setText("Contacting Microsoft for download options...")
 
-        found = rufus.find_existing_isos(entry, downloads_dir)
-        if found:
-            self.existing_box.setVisible(True)
-            self.existing_list.clear()
-            for p in found:
-                stat = p.stat()
-                label = f"{p.name}  ({fmt_size(stat.st_size)}, {datetime.fromtimestamp(stat.st_mtime):%Y-%m-%d %H:%M})"
-                item = QListWidgetItem(label)
-                item.setData(Qt.UserRole, p)
-                self.existing_list.addItem(item)
+        self._show_existing(rufus.find_existing_isos(entry, downloads_dir))
 
         self._fetch_worker = FetchOptionsWorker(entry)
         self._fetch_worker.ready.connect(self._on_options_ready)
         self._fetch_worker.error.connect(self._on_options_error)
         self._fetch_worker.start()
 
+    def _show_existing(self, found):
+        if not found:
+            return
+        self.existing_box.setVisible(True)
+        self.existing_list.clear()
+        for p in found:
+            stat = p.stat()
+            label = f"{p.name}  ({fmt_size(stat.st_size)}, {datetime.fromtimestamp(stat.st_mtime):%Y-%m-%d %H:%M})"
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, p)
+            self.existing_list.addItem(item)
+        # Newest finished ISO is picked automatically; Next is ready to go.
+        self.existing_list.setCurrentRow(0)
+        self._use_existing()
+        self.status_label.setText(f"Found an existing ISO — using {found[0].name}. "
+                                  "Pick another below, or download a fresh copy.")
+
+    def _start_direct_download(self):
+        option = self.direct_combo.currentData()
+        if option:
+            self.on_start_download(mode="direct", entry=self.entry,
+                                   downloads_dir=self.downloads_dir, option=option)
+
     def _on_options_ready(self, editions, skus, session, edition_id):
         self.session = session
         self.edition_id = edition_id
         self.skus = skus
-        self.status_label.setText("Pick an edition/language, then download — or use an existing file above.")
+        if not self.selected_path:
+            self.status_label.setText("Pick an edition/language, then download — or use an existing file above.")
         self.download_box.setVisible(True)
 
         self.edition_combo.clear()
@@ -595,6 +669,30 @@ class ConfirmPage(QWidget):
         self.summary_label = QLabel("")
         layout.addWidget(self.summary_label)
 
+        # -- Linux settings (shown only for Linux ISOs) --
+        self.linux_box = QGroupBox("Linux USB settings")
+        lv = QVBoxLayout(self.linux_box)
+        self.live_radio = QRadioButton("Live bootable USB (write image as-is) — recommended")
+        self.live_radio.setToolTip("Boots on BIOS and UEFI. Works for live sessions and installers.")
+        self.copy_radio = QRadioButton("Copy files to FAT32 (UEFI only)")
+        self.live_radio.toggled.connect(self._sync_linux_widgets)
+        lv.addWidget(self.live_radio)
+        lv.addWidget(self.copy_radio)
+        self.verify_check = QCheckBox("Verify drive after writing (slower)")
+        lv.addWidget(self.verify_check)
+        self.scheme_combo = QComboBox()
+        self.scheme_combo.addItems(["MBR", "GPT"])
+        self.scheme_row = QLabel("Partition scheme:")
+        lv.addWidget(self.scheme_row)
+        lv.addWidget(self.scheme_combo)
+        self.label_caption = QLabel("Volume label (max 11 chars; keep default unless you know otherwise):")
+        self.label_edit = QLineEdit()
+        self.label_edit.setMaxLength(11)
+        lv.addWidget(self.label_caption)
+        lv.addWidget(self.label_edit)
+        layout.addWidget(self.linux_box)
+        self.linux_box.setVisible(False)
+
         self.checkbox = QCheckBox("I understand this drive will be completely erased")
         self.checkbox.stateChanged.connect(self._on_checked)
         layout.addWidget(self.checkbox)
@@ -610,7 +708,32 @@ class ConfirmPage(QWidget):
         btn_row.addWidget(self.flash_btn)
         layout.addLayout(btn_row)
 
-    def load(self, iso_path: Path, drive: dict):
+    def _sync_linux_widgets(self, *_):
+        live = self.live_radio.isChecked()
+        self.verify_check.setVisible(live)
+        for w in (self.scheme_row, self.scheme_combo, self.label_caption, self.label_edit):
+            w.setVisible(not live)
+
+    def linux_opts(self):
+        """Settings dict for the worker, or None for a Windows ISO."""
+        if not self.linux_box.isVisibleTo(self):
+            return None
+        return {
+            "mode": "dd" if self.live_radio.isChecked() else "copy",
+            "scheme": self.scheme_combo.currentText(),
+            "label": rufus._fat_label(self.label_edit.text()),
+            "verify": self.verify_check.isChecked(),
+        }
+
+    def load(self, iso_path: Path, drive: dict, probed: dict | None = None):
+        self.linux_box.setVisible(bool(probed and probed["kind"] == "linux"))
+        if self.linux_box.isVisibleTo(self):
+            self.live_radio.setEnabled(probed["hybrid"])
+            self.copy_radio.setEnabled(probed["uefi"])
+            (self.live_radio if probed["hybrid"] else self.copy_radio).setChecked(True)
+            self.label_edit.setText(rufus._fat_label(probed["label"]))
+            self.verify_check.setChecked(False)
+            self._sync_linux_widgets()
         self.warning_label.setText(
             f"{drive['node']} ({drive['name']}, {fmt_size(drive['size'])}) will be COMPLETELY ERASED."
         )
@@ -628,8 +751,12 @@ class FlashPage(QWidget):
         ("bootsectors", "Write boot sectors"),
         ("copy_files", "Copy boot files"),
         ("copy_wim", "Copy Windows image"),
+        ("write", "Write image to drive"),
         ("eject", "Flush & eject"),
     ]
+    WINDOWS_STAGES = ("mount", "format", "bootsectors", "copy_files", "copy_wim", "eject")
+    LINUX_DD_STAGES = ("write", "eject")
+    LINUX_COPY_STAGES = ("mount", "copy_files", "eject")
 
     def __init__(self, on_done, on_error_back):
         super().__init__()
@@ -656,13 +783,16 @@ class FlashPage(QWidget):
         self.detail_label = QLabel("")
         layout.addWidget(self.detail_label)
 
-    def start(self, iso_path: Path, disk_node: str):
+    def start(self, iso_path: Path, disk_node: str, linux_opts: dict | None = None):
+        active = (self.WINDOWS_STAGES if not linux_opts
+                  else self.LINUX_DD_STAGES if linux_opts["mode"] == "dd" else self.LINUX_COPY_STAGES)
         for key, label in self.STAGES:
             self.stage_labels[key].setText(f"○  {label}")
+            self.stage_labels[key].setVisible(key in active)
         self.bar.setValue(0)
         self.detail_label.setText("Waiting for administrator authorization...")
 
-        self.worker = FlashWorker(iso_path, disk_node)
+        self.worker = FlashWorker(iso_path, disk_node, linux_opts)
         self.worker.stage.connect(self._on_stage)
         self.worker.finished_ok.connect(self._on_finished)
         self.worker.error.connect(self._on_error)
@@ -681,7 +811,12 @@ class FlashPage(QWidget):
             elif status == "skipped":
                 label.setText(f"—  {base} (not needed)")
 
-        if stage == "copy_files" and status == "progress":
+        if stage in ("write", "verify") and status == "progress":
+            done, total = data.get("done", 0), data.get("total", 1)
+            self.bar.setValue(int(done * 100 / total) if total else 0)
+            verb = "Writing" if stage == "write" else "Verifying"
+            self.detail_label.setText(f"{verb}: {fmt_size(done)} / {fmt_size(total)}")
+        elif stage == "copy_files" and status == "progress":
             done, total = data.get("done", 0), data.get("total", 1)
             self.bar.setValue(int(done * 100 / total) if total else 0)
             self.detail_label.setText(f"{done}/{total} files — {data.get('filename', '')}")
@@ -721,7 +856,8 @@ class DonePage(QWidget):
         layout.addWidget(restart_btn)
 
     def load(self, iso_path: Path, drive: dict, data: dict):
-        boot_mode = "UEFI + Legacy BIOS" if data.get("uefi") else "Legacy BIOS only (enable CSM on target PC)"
+        boot_mode = data.get("boot_note") or (
+            "UEFI + Legacy BIOS" if data.get("uefi") else "Legacy BIOS only (enable CSM on target PC)")
         elapsed = rufus.fmt_duration(data.get("elapsed", 0))
         self.summary.setPlainText(
             f"ISO: {iso_path.name}\n"
@@ -743,6 +879,7 @@ class MainWindow(QMainWindow):
 
         self.iso_path = None
         self.drive = None
+        self.probed = None
         self.downloads_dir = rufus.get_downloads_dir()
 
         self.stack = QStackedWidget()
@@ -760,30 +897,6 @@ class MainWindow(QMainWindow):
                      self.confirm_page, self.flash_page, self.done_page):
             self.stack.addWidget(page)
 
-        self._check_resumable_downloads()
-
-    def _check_resumable_downloads(self):
-        items = rufus.find_incomplete_downloads(self.downloads_dir)
-        for item in items:
-            state, part_path = item["state"], item["part_path"]
-            so_far = part_path.stat().st_size
-            label = f"{state.get('entry_name', 'ISO')} ({state.get('sku_language', '?')})"
-            reply = QMessageBox.question(
-                self, "Resume download?",
-                f"Found an incomplete {label} download — {fmt_size(so_far)} saved.\n\nResume it?",
-                QMessageBox.Yes | QMessageBox.No,
-            )
-            if reply == QMessageBox.Yes:
-                self.stack.setCurrentWidget(self.download_page)
-                self.download_page.start("resume", item=item)
-                return
-            discard = QMessageBox.question(
-                self, "Discard?", "Discard this incomplete download?",
-                QMessageBox.Yes | QMessageBox.No,
-            )
-            if discard == QMessageBox.Yes:
-                part_path.unlink(missing_ok=True)
-                item["state_path"].unlink(missing_ok=True)
 
     # -- navigation --
     def _go_os_page(self):
@@ -805,9 +918,9 @@ class MainWindow(QMainWindow):
         self.iso_page.load(entry, self.downloads_dir)
         self.stack.setCurrentWidget(self.iso_page)
 
-    def _on_start_download(self, **kwargs):
+    def _on_start_download(self, mode="fresh", **kwargs):
         self.stack.setCurrentWidget(self.download_page)
-        self.download_page.start("fresh", **kwargs)
+        self.download_page.start(mode, **kwargs)
 
     def _on_download_done(self, path: Path):
         self._on_iso_ready(path)
@@ -819,12 +932,26 @@ class MainWindow(QMainWindow):
 
     def _on_usb_chosen(self, drive: dict):
         self.drive = drive
-        self.confirm_page.load(self.iso_path, drive)
+        try:
+            self.probed = rufus.probe_iso(self.iso_path)
+        except Exception as e:
+            QMessageBox.critical(self, "Couldn't read ISO", str(e))
+            return
+        if self.probed["kind"] == "linux" and not (self.probed["hybrid"] or self.probed["uefi"]):
+            QMessageBox.critical(self, "Unsupported ISO",
+                                 "This ISO isn't hybrid and has no UEFI boot files, so it can't be made "
+                                 "bootable from macOS.")
+            return
+        if self.probed["kind"] == "linux" and self.probed["hybrid"] and self.probed["size"] > drive["size"]:
+            QMessageBox.critical(self, "Drive too small",
+                                 f"The ISO ({fmt_size(self.probed['size'])}) is larger than the drive.")
+            return
+        self.confirm_page.load(self.iso_path, drive, self.probed)
         self.stack.setCurrentWidget(self.confirm_page)
 
     def _on_confirmed(self):
         self.stack.setCurrentWidget(self.flash_page)
-        self.flash_page.start(self.iso_path, self.drive["node"])
+        self.flash_page.start(self.iso_path, self.drive["node"], self.confirm_page.linux_opts())
 
     def _on_flash_done(self, data: dict):
         self.done_page.load(self.iso_path, self.drive, data)
