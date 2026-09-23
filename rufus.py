@@ -29,7 +29,7 @@ from rich.text import Text
 console = Console()
 log: logging.Logger = logging.getLogger("rufus")
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 _GITHUB_REPO = "yaviral17/macos-rufus"
 _UPDATE_CHECK_INTERVAL = 24 * 3600  # don't hit the GitHub API more than once a day
 
