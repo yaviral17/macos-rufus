@@ -22,7 +22,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QAction, QFont
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QFileDialog, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
@@ -274,6 +274,31 @@ class FlashWorker(QThread):
                 if data.get("stage") == "error":
                     self.error.emit(data.get("message", "Unknown error"))
                     return
+
+
+class UpdateCheckWorker(QThread):
+    """Hits GitHub for the latest release off the UI thread."""
+    done = Signal(object)  # dict | None
+
+    def __init__(self, force: bool = False):
+        super().__init__()
+        self.force = force
+
+    def run(self):
+        try:
+            self.done.emit(rufus.check_for_update(force=self.force))
+        except Exception:
+            self.done.emit(None)
+
+
+class SelfUpdateWorker(QThread):
+    ok = Signal(bool)
+
+    def run(self):
+        try:
+            self.ok.emit(rufus.self_update())
+        except Exception:
+            self.ok.emit(False)
 
 
 # ── UI pages ──────────────────────────────────────────────────────────────────
@@ -874,16 +899,40 @@ class DonePage(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("macos-rufus")
+        self.setWindowTitle(f"macos-rufus v{rufus.__version__}")
         self.resize(640, 520)
 
         self.iso_path = None
         self.drive = None
         self.probed = None
         self.downloads_dir = rufus.get_downloads_dir()
+        self._update_worker = None
+        self._self_update_worker = None
+        self._latest_update = None
+
+        help_menu = self.menuBar().addMenu("Help")
+        check_update_action = QAction("Check for Updates...", self)
+        check_update_action.triggered.connect(lambda: self._check_for_updates(force=True, interactive=True))
+        help_menu.addAction(check_update_action)
+
+        central = QWidget()
+        outer = QVBoxLayout(central)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self.update_banner = QLabel("")
+        self.update_banner.setStyleSheet(
+            "background: #fff3cd; color: #664d03; padding: 8px 12px;")
+        self.update_banner.setWordWrap(True)
+        self.update_banner.setVisible(False)
+        self.update_banner.setTextFormat(Qt.RichText)
+        self.update_banner.setOpenExternalLinks(False)
+        self.update_banner.linkActivated.connect(self._on_banner_link)
+        outer.addWidget(self.update_banner)
 
         self.stack = QStackedWidget()
-        self.setCentralWidget(self.stack)
+        outer.addWidget(self.stack)
+        self.setCentralWidget(central)
 
         self.os_page = OsSelectPage(self._on_os_chosen)
         self.iso_page = IsoAcquirePage(self._on_iso_ready, self._on_start_download, self._go_os_page)
@@ -897,6 +946,56 @@ class MainWindow(QMainWindow):
                      self.confirm_page, self.flash_page, self.done_page):
             self.stack.addWidget(page)
 
+        # Quiet background check — only a banner if something's actually new.
+        self._check_for_updates(force=False, interactive=False)
+
+    # -- updates --
+    def _check_for_updates(self, force: bool, interactive: bool):
+        self._update_worker = UpdateCheckWorker(force=force)
+        self._update_worker.done.connect(lambda u: self._on_update_checked(u, interactive))
+        self._update_worker.start()
+
+    def _on_update_checked(self, update: dict | None, interactive: bool):
+        self._latest_update = update
+        if update:
+            self.update_banner.setText(
+                f"<b>{update['name']}</b> is available (you have v{rufus.__version__}). "
+                f'<a href="update">Update now</a> · <a href="dismiss">Dismiss</a>'
+            )
+            self.update_banner.setVisible(True)
+        elif interactive:
+            QMessageBox.information(self, "Up to date", f"You're on the latest version (v{rufus.__version__}).")
+
+    def _on_banner_link(self, link: str):
+        if link == "dismiss":
+            self.update_banner.setVisible(False)
+            return
+        if not self._latest_update:
+            return
+        reply = QMessageBox.question(
+            self, "Update macos-rufus",
+            f"Update to {self._latest_update['name']} now?\n\n"
+            "The app will need to restart afterwards.",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self.update_banner.setText("Updating...")
+        self._self_update_worker = SelfUpdateWorker()
+        self._self_update_worker.ok.connect(self._on_self_updated)
+        self._self_update_worker.start()
+
+    def _on_self_updated(self, ok: bool):
+        if not ok:
+            self.update_banner.setText(
+                "Update failed or needs to be applied manually — see the terminal/log for details. "
+                '<a href="dismiss">Dismiss</a>'
+            )
+            return
+        QMessageBox.information(
+            self, "Updated", "macos-rufus was updated. It will now restart.")
+        subprocess.Popen([sys.executable] + sys.argv)
+        QApplication.quit()
 
     # -- navigation --
     def _go_os_page(self):

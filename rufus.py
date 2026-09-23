@@ -29,6 +29,10 @@ from rich.text import Text
 console = Console()
 log: logging.Logger = logging.getLogger("rufus")
 
+__version__ = "1.2.0"
+_GITHUB_REPO = "yaviral17/macos-rufus"
+_UPDATE_CHECK_INTERVAL = 24 * 3600  # don't hit the GitHub API more than once a day
+
 
 def setup_logger() -> Path:
     logs_dir = Path(__file__).parent / "logs"
@@ -82,6 +86,124 @@ def _auto_install(package: str, binary: str, reason: str):
         console.print(f"[green]✓ {package} installed[/green]")
     else:
         console.print(f"[dim]Skipping {package}.[/dim]")
+
+
+# ── self-update ───────────────────────────────────────────────────────────────
+
+def _version_tuple(v: str) -> tuple[int, ...]:
+    return tuple(int(n) for n in re.findall(r"\d+", v)[:3]) or (0,)
+
+
+def _update_state_path() -> Path:
+    d = get_user_home() / ".macos-rufus"
+    try:
+        d.mkdir(exist_ok=True)
+        _chown_to_login_user(d)
+    except OSError:
+        pass
+    return d / "update_check.json"
+
+
+def fetch_latest_release() -> dict | None:
+    """Hits the GitHub API for the newest release. Returns None on any
+    network/API failure — an update check must never break the main flow."""
+    try:
+        resp = requests.get(
+            f"https://api.github.com/repos/{_GITHUB_REPO}/releases/latest",
+            timeout=5, headers={"Accept": "application/vnd.github+json", "User-Agent": _DOWNLOAD_UA},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return {
+            "tag": data["tag_name"],
+            "name": data.get("name") or data["tag_name"],
+            "notes": (data.get("body") or "").strip(),
+            "url": data.get("html_url", f"https://github.com/{_GITHUB_REPO}/releases/latest"),
+        }
+    except (requests.RequestException, KeyError, ValueError):
+        return None
+
+
+def check_for_update(force: bool = False) -> dict | None:
+    """Returns the latest release's info if it's newer than this build,
+    else None. Cached for _UPDATE_CHECK_INTERVAL unless force=True."""
+    cache_path = _update_state_path()
+    if not force and cache_path.exists():
+        try:
+            cached = json.loads(cache_path.read_text())
+            if time.time() - cached.get("checked_at", 0) < _UPDATE_CHECK_INTERVAL:
+                latest = cached.get("latest")
+                return latest if latest and _version_tuple(latest["tag"]) > _version_tuple(__version__) else None
+        except (json.JSONDecodeError, OSError, KeyError):
+            pass
+
+    latest = fetch_latest_release()
+    try:
+        cache_path.write_text(json.dumps({"checked_at": time.time(), "latest": latest}))
+        _chown_to_login_user(cache_path)
+    except OSError:
+        pass
+
+    if latest and _version_tuple(latest["tag"]) > _version_tuple(__version__):
+        return latest
+    return None
+
+
+def print_update_banner(update: dict):
+    console.print(Panel(
+        f"[bold]{update['name']}[/bold] is available (you have v{__version__}).\n\n"
+        f"{update['notes'] or update['url']}",
+        title="[yellow]Update available[/yellow]", style="yellow", subtitle=f"[dim]{update['url']}[/dim]",
+    ))
+
+
+def _install_method() -> str:
+    """'brew', 'git', or 'unknown' — how this copy of macos-rufus got here,
+    which decides how self_update() can apply an update."""
+    script_dir = Path(__file__).resolve().parent
+    if "Cellar" in script_dir.parts:
+        return "brew"
+    if (script_dir / ".git").is_dir():
+        return "git"
+    brew = shutil.which("brew")
+    if brew:
+        res = run([brew, "list", "--versions", "macos-rufus"], check=False)
+        if res.returncode == 0 and res.stdout.strip():
+            return "brew"
+    return "unknown"
+
+
+def self_update() -> bool:
+    """Applies the update in place. Returns True if it's safe to restart."""
+    method = _install_method()
+    script_dir = Path(__file__).resolve().parent
+
+    if method == "brew":
+        console.print("[dim]Updating via Homebrew...[/dim]")
+        _brew_run(["update"])
+        _brew_run(["upgrade", "macos-rufus"])
+        return True
+
+    if method == "git":
+        status = run(["git", "-C", str(script_dir), "status", "--porcelain"], check=False)
+        if status.stdout.strip():
+            console.print(
+                "[yellow]Local changes in the install directory — not auto-updating.[/yellow]\n"
+                f"[dim]Update manually: cd {script_dir} && git pull[/dim]"
+            )
+            return False
+        console.print("[dim]Updating via git pull...[/dim]")
+        result = run(["git", "-C", str(script_dir), "pull", "--ff-only"], check=False, capture=False)
+        if result.returncode != 0:
+            console.print("[red]git pull failed — update manually.[/red]")
+            return False
+        return True
+
+    console.print(
+        f"[yellow]Couldn't tell how macos-rufus was installed here.[/yellow] "
+        f"Download the latest release manually: https://github.com/{_GITHUB_REPO}/releases/latest"
+    )
+    return False
 
 
 def check_deps():
@@ -1482,11 +1604,45 @@ def flash_linux_cli(iso_path: Path, selected: dict, probed: dict, opts: dict, lo
 
 
 def main():
+    if "--version" in sys.argv:
+        console.print(f"macos-rufus v{__version__}")
+        return
+
+    if "--check-update" in sys.argv or "--update" in sys.argv:
+        console.print(f"[dim]macos-rufus v{__version__} — checking for updates...[/dim]")
+        update = check_for_update(force=True)
+        if not update:
+            console.print("[green]✓ You're on the latest version.[/green]")
+            return
+        print_update_banner(update)
+        if "--update" in sys.argv:
+            if self_update():
+                console.print("[green]✓ Updated.[/green] Run macos-rufus again to use the new version.")
+            else:
+                console.print("[yellow]Update not applied.[/yellow]")
+        return
+
     console.print(Panel(
         "[bold white]macos-rufus[/bold white]  —  Windows & Linux bootable USB creator",
         subtitle="macOS · UEFI + Legacy BIOS · Win7/8/8.1/10/11 · Ubuntu/Arch/Kali/Pop!_OS/Omarchy",
         style="bold blue",
     ))
+
+    # Check before escalate_to_root() so this runs (and, if applied, updates
+    # files) as the normal user rather than root.
+    update = check_for_update()
+    if update:
+        print_update_banner(update)
+        try:
+            wants_update = Confirm.ask("Update now?", default=False)
+        except KeyboardInterrupt:
+            wants_update = False
+        if wants_update:
+            if self_update():
+                console.print("[green]✓ Updated — restarting...[/green]\n")
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+            else:
+                console.print("[dim]Continuing with the current version.[/dim]")
 
     escalate_to_root()
     log_path = setup_logger()

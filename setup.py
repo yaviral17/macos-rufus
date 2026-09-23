@@ -2,7 +2,13 @@
 
 Requires py2app: pip install py2app
 """
+import sys
+from pathlib import Path
+
 from setuptools import setup
+
+sys.path.insert(0, str(Path(__file__).parent))
+import rufus  # noqa: E402 — needed after sys.path tweak, for __version__ below
 
 APP = ["gui.py"]
 DATA_FILES = ["rufus.py", "rufus_worker.py"]
@@ -13,7 +19,7 @@ OPTIONS = {
         "CFBundleName": "macos-rufus",
         "CFBundleDisplayName": "macos-rufus",
         "CFBundleIdentifier": "com.macos-rufus.gui",
-        "CFBundleShortVersionString": "1.0.0",
+        "CFBundleShortVersionString": rufus.__version__,
         "NSHighResolutionCapable": True,
         # This app never runs as root itself (see rufus_worker.py) — only the
         # backgrounded disk-writing worker is elevated, via a native macOS
