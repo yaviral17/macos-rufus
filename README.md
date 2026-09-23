@@ -39,6 +39,7 @@ If you've ever searched for:
 | **Resumable downloads** | Kill the script mid-download and it'll offer to pick up where it left off next run — even regenerating an expired link automatically |
 | **Auto self-elevation** | Prompts for your password itself — no `sudo` prefix needed |
 | **Auto-installs dependencies** | Missing `wimlib`? Script offers to install via Homebrew automatically |
+| **Auto-detects & applies updates** | Checks GitHub for a newer release on startup (at most once a day) and offers to update itself — via `brew upgrade` or `git pull`, whichever way you installed it |
 | **Handles install.wim > 4 GB** | Splits oversized WIM files — the #1 cause of failure on other tools |
 | **Writes Windows VBR boot sector** | Patches `boot/bootsect.dat` from the ISO onto the USB — required for Win7 legacy BIOS boot |
 | **Sets MBR active partition flag** | Pure Python struct write — no `ms-sys` or external tool required |
@@ -327,6 +328,27 @@ Download official ISOs directly from Microsoft:
 - **Windows 7**: [microsoft.com/software-download/windows7](https://www.microsoft.com/software-download/windows7) *(requires product key)*
 
 > **Tip for macOS users:** Microsoft's download page sometimes redirects to the Media Creation Tool (Windows-only exe). In Safari, go to **Develop → User Agent → change to any non-Windows browser** — the direct ISO download link appears.
+
+---
+
+## 🔄 Updating
+
+macos-rufus checks GitHub for a newer release on startup (cached for 24h, so
+it won't slow down every run) and offers to update itself in place — via
+`brew upgrade` if you installed it with Homebrew, or `git pull` if you're
+running from a cloned checkout. In the GUI, the same check runs quietly on
+launch and shows a dismissible banner when an update is available, plus a
+**Help → Check for Updates...** menu item to check on demand.
+
+```
+python3 rufus.py --check-update   # just check, don't apply
+python3 rufus.py --update         # check and update if available
+python3 rufus.py --version        # print the installed version
+```
+
+If the script can't tell how it was installed, or the install directory has
+local changes, it won't touch anything — it just prints the update URL so
+you can grab it manually.
 
 ---
 
