@@ -1394,6 +1394,12 @@ def copy_wim_direct(wim_path: Path, dst: Path, progress_cb=None):
     size = wim_path.stat().st_size
     chunk = 4 * 1024 * 1024  # 4 MB — good balance for USB sequential write
 
+    # Deliberately not os.sendfile: on macOS/BSD sendfile(2) requires the
+    # destination fd to be a socket and fails with ENOTSOCK for file->file.
+    # readinto on a reused buffer keeps this allocation-free per chunk.
+    buf = bytearray(chunk)
+    view = memoryview(buf)
+
     if progress_cb is None:
         console.print(f"\n[dim]Copying {wim_path.name} ({fmt_size(size)})...[/dim]")
         with Progress(
@@ -1407,22 +1413,22 @@ def copy_wim_direct(wim_path: Path, dst: Path, progress_cb=None):
         ) as progress:
             task = progress.add_task("wim", total=size, filename=wim_path.name)
             with open(wim_path, "rb") as fsrc, open(dst_file, "wb") as fdst:
-                in_fd, out_fd, offset = fsrc.fileno(), fdst.fileno(), 0
-                while offset < size:
-                    sent = os.sendfile(out_fd, in_fd, offset, min(chunk, size - offset))
-                    if sent == 0:
+                while True:
+                    n = fsrc.readinto(buf)
+                    if not n:
                         break
-                    offset += sent
-                    progress.advance(task, sent)
+                    fdst.write(view[:n])
+                    progress.advance(task, n)
     else:
-        progress_cb(0, size)
+        offset = 0
+        progress_cb(offset, size)
         with open(wim_path, "rb") as fsrc, open(dst_file, "wb") as fdst:
-            in_fd, out_fd, offset = fsrc.fileno(), fdst.fileno(), 0
-            while offset < size:
-                sent = os.sendfile(out_fd, in_fd, offset, min(chunk, size - offset))
-                if sent == 0:
+            while True:
+                n = fsrc.readinto(buf)
+                if not n:
                     break
-                offset += sent
+                fdst.write(view[:n])
+                offset += n
                 progress_cb(offset, size)
     shutil.copystat(wim_path, dst_file)
 
