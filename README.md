@@ -34,6 +34,9 @@ If you've ever searched for:
 | Feature | Details |
 |---|---|
 | **Windows 7, 8, 8.1, 10, 11 support** | All versions, UEFI and legacy BIOS |
+| **Built-in Windows 10/11 ISO downloader** | Pick an OS from a menu — fetches the real Microsoft ISO link directly, no Media Creation Tool |
+| **Managed download folder** | Downloaded ISOs are saved to `~/Downloads/macos-rufus/isos` and reused on later runs instead of re-downloading |
+| **Resumable downloads** | Kill the script mid-download and it'll offer to pick up where it left off next run — even regenerating an expired link automatically |
 | **Auto self-elevation** | Prompts for your password itself — no `sudo` prefix needed |
 | **Auto-installs dependencies** | Missing `wimlib`? Script offers to install via Homebrew automatically |
 | **Handles install.wim > 4 GB** | Splits oversized WIM files — the #1 cause of failure on other tools |
@@ -92,6 +95,10 @@ python3 -m venv venv
 pip install -r requirements.txt
 ```
 
+> The first time you use the automatic Windows 10/11 ISO downloader, the
+> script will offer to run `playwright install chromium` for you (one-time,
+> ~150–300 MB) — needed to get past Microsoft's download-page bot detection.
+
 **4. Run it**
 
 ```bash
@@ -102,7 +109,44 @@ venv/bin/python3 rufus.py
 
 ---
 
-## 📖 Step-by-Step Usage
+## 🖱️ GUI App
+
+Prefer a point-and-click app over the terminal? `gui.py` is a PySide6
+(Qt) wizard built on top of the exact same `rufus.py` logic — OS selection,
+resumable downloads, disk formatting, and boot-sector writing are unchanged;
+this just adds a windowed front-end.
+
+**Run it from source:**
+
+```bash
+pip install -r requirements.txt   # includes PySide6
+python3 gui.py
+```
+
+**Build it into a real double-clickable `macos-rufus.app`:**
+
+```bash
+pip install py2app
+python3 setup.py py2app
+open dist/macos-rufus.app
+```
+
+**How privileges work in the GUI:** unlike the CLI (which re-execs itself as
+root immediately), the GUI app itself never runs as root. Only the final
+"Flash Drive" step launches `rufus_worker.py` — a small script that does the
+actual mounting/formatting/writing — as root, via macOS's native
+administrator-password dialog (the same one any signed installer uses). The
+GUI window stays a normal, unprivileged process the whole time and just
+watches that worker's progress.
+
+The wizard flow: pick an OS → download or browse for an ISO (pause/resume
+supported, same as the CLI) → pick a USB drive → confirm → watch it flash →
+done. An incomplete download from a previous session is detected on launch
+and offered for resume automatically.
+
+---
+
+## 📖 Step-by-Step Usage (CLI)
 
 ```
 ╭──────────────────────────────────────────────────────────────╮
@@ -111,7 +155,37 @@ venv/bin/python3 rufus.py
 ╰──────────────────────────────────────────────────────────────╯
 ```
 
-**Step 1 — Enter ISO path**
+**Step 1 — Pick an OS**
+
+```
+                  Select Operating System
+┏━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━┓
+┃ #   ┃ OS                         ┃ Auto-download        ┃
+┡━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━┩
+│ 1   │ Windows 11                 │ Yes                  │
+│ 2   │ Windows 10                 │ Yes                  │
+│ 3   │ Windows 8.1                │ No — manual ISO only │
+│ 4   │ Windows 7                  │ No — manual ISO only │
+│ 5   │ I already have an ISO file │ No — manual ISO only │
+└─────┴────────────────────────────┴──────────────────────┘
+Select an OS: 1
+```
+
+- **Windows 10 / 11** — pick an edition and language, and the script fetches
+  a real, direct ISO link (the same one behind the "no Media Creation Tool"
+  trick) and downloads it straight into `~/Downloads/macos-rufus/isos`.
+  - Getting the actual download link requires briefly driving a real
+    (headless) Chromium browser, because Microsoft's link-generation API
+    blocks plain HTTP requests with bot detection. The first time you use
+    this, you'll be prompted to let Playwright download Chromium
+    (one-time, ~150–300 MB).
+  - If a matching ISO was already downloaded before, you'll be offered it
+    first instead of downloading again.
+  - If the script is killed mid-download, the next run detects the partial
+    file and offers to resume it — even regenerating the link automatically
+    if it expired in the meantime.
+- **Windows 8.1 / 7 / "I already have an ISO"** — Microsoft no longer serves
+  these through the API, so you'll be prompted for a path instead:
 
 ```
 Path to Windows ISO: /Users/you/Downloads/Win11_23H2_English_x64.iso
@@ -181,6 +255,8 @@ Unlike Linux ISOs (hybrid ISOs that `dd` writes byte-for-byte), **Windows ISOs a
 FAT32 has a hard per-file limit of 4,294,967,295 bytes (~4 GiB). Windows 11's `install.wim` often exceeds this. Most tools fail silently here.
 
 **macos-rufus** detects this automatically and uses `wimlib-imagex split` to break the WIM into 3,800 MB chunks (`install.swm`, `install2.swm`, …). The Windows installer natively reassembles split WIM files — no extra steps on the target machine.
+
+Newer Windows 11 ISOs (24H2+) store `install.wim` as a *solid* WIM, which wimlib cannot split directly. In that case macos-rufus first re-exports it to a regular (LZX) WIM in a temporary folder, then splits it. This takes a few extra minutes and needs free space on your Mac roughly equal to the size of `install.wim` — it is checked before the USB is erased.
 
 ### Windows 7 legacy BIOS boot — the VBR problem
 
@@ -265,7 +341,8 @@ Download official ISOs directly from Microsoft:
 ### "install.wim splitting fails"
 
 - Run `brew install wimlib` manually and retry
-- Check free disk space — the split writes chunks to the USB as it goes
+- Check free disk space — the split writes chunks to the USB as it goes, and solid WIMs (Win 11 24H2+) need temporary space on your Mac too
+- Garbled box-drawing characters (`â macos-rufus â`) mean your terminal isn't using UTF-8; run `export LANG=en_US.UTF-8` first
 
 ### "USB not booting on target machine"
 
@@ -273,6 +350,17 @@ Download official ISOs directly from Microsoft:
 2. For Windows 8.1/10/11 — select USB under **UEFI** boot entries
 3. Disable **Secure Boot** if Windows Setup won't launch (re-enable after install)
 4. For Windows 7 or older PCs — enable **CSM / Legacy Boot** in BIOS
+
+### "Automatic download failed" / "Sentinel marked this request as rejected"
+
+Microsoft's link-generation API is protected by bot detection that blocks
+plain HTTP requests — the script works around this by driving a real
+headless Chromium browser through the actual download page instead. If you
+still see this error:
+
+- Make sure Playwright's Chromium is installed: `python3 -m playwright install chromium`
+- Check your internet connection can reach `microsoft.com` normally
+- As a last resort, download the ISO manually (see below) and provide the path when prompted
 
 ### "hdiutil: attach failed"
 
@@ -297,8 +385,11 @@ The script calls `sudo` internally via `os.execvp` and will prompt for your pass
 
 ```
 macos-rufus/
-├── rufus.py          # Main CLI tool — all logic lives here
-├── requirements.txt  # Python dependencies (just: rich)
+├── rufus.py          # CLI tool + all shared logic (OS catalog, downloads, disk ops)
+├── rufus_worker.py   # Privileged flash worker used by the GUI (runs as root)
+├── gui.py            # PySide6 GUI wizard, built on top of rufus.py
+├── setup.py          # py2app config to build macos-rufus.app
+├── requirements.txt  # Python dependencies
 ├── venv/             # Python virtual environment (not committed)
 └── README.md         # This file
 ```
@@ -310,7 +401,8 @@ macos-rufus/
 - **External-only disk listing** — internal drives are never shown as targets
 - **Explicit confirmation** before any destructive operation
 - **Read-only ISO mount** — source ISO is never modified
-- **Self-elevation only when needed** — script requests root via `sudo` transparently; no silent privilege escalation
+- **Self-elevation only when needed** — the CLI requests root via `sudo` transparently; no silent privilege escalation
+- **GUI never runs as root** — only the disk-writing worker it launches does, via macOS's native administrator-password dialog, for just the flash step
 
 ---
 
