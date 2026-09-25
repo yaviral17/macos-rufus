@@ -1,0 +1,39 @@
+name: Bug report
+description: Something isn't working as expected
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      placeholder: e.g. macOS 14.5, Apple Silicon
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: e.g. 3.12.3
+  - type: input
+    id: iso
+    attributes:
+      label: Windows ISO
+      placeholder: e.g. Windows 11 23H2 x64
+  - type: textarea
+    id: logs
+    attributes:
+      label: Terminal output
+      render: shell
