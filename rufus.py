@@ -6,15 +6,19 @@ import logging
 import os
 import plistlib
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
+from typing import NamedTuple
+from urllib.parse import unquote
 
 import requests
 from rich.console import Console
@@ -22,7 +26,9 @@ from rich.panel import Panel
 from rich.progress import (BarColumn, FileSizeColumn, MofNCompleteColumn,
                            Progress, TextColumn, TimeRemainingColumn,
                            TransferSpeedColumn)
-from rich.prompt import Confirm, Prompt
+from rich.markup import escape
+from rich.prompt import Confirm as _RichConfirm
+from rich.prompt import Prompt as _RichPrompt
 from rich.table import Column, Table
 from rich.text import Text
 
@@ -47,6 +53,154 @@ def setup_logger() -> Path:
     return log_path
 
 FAT32_LIMIT = 4 * 1024 ** 3  # 4 GiB
+
+
+# ── terminal input ────────────────────────────────────────────────────────────
+
+# Terminals in bracketed-paste mode wrap pasted text in ESC[200~ … ESC[201~.
+# Without GNU readline (macOS Python ships libedit) those markers, and any
+# arrow-key sequences, land in the answer as literal characters. libedit
+# swallows the leading "ESC[2" as an unknown key, leaving "00~" … "01~".
+_BRACKETED_PASTE_OFF = "\x1b[?2004l"
+_PASTE_MARKERS = re.compile(r"(?:\x1b|\^\[)\[20[01]~")
+_PASTE_MARKER_REMNANTS = re.compile(r"^00~(.*)01~$")
+_ESCAPE_SEQUENCES = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|O.|.)?")
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
+_FILE_URL_PREFIXES = ("file://localhost", "file://")  # longest first
+
+
+def sanitize_input(raw: str) -> str:
+    """Strip paste markers, stray escape sequences and control characters."""
+    text = _PASTE_MARKERS.sub("", raw)
+    text = _ESCAPE_SEQUENCES.sub("", text)
+    text = _CONTROL_CHARS.sub("", text.replace("\t", " ")).strip()
+    text = _PASTE_MARKER_REMNANTS.sub(r"\1", text).strip()
+    return unicodedata.normalize("NFC", text)
+
+
+class PathInput(NamedTuple):
+    found: list[Path]        # every path the input named, all of which exist
+    not_found: Path | None   # else: the best guess at the path that was meant
+
+
+def _shell_words(text: str) -> list[str]:
+    """Split the text the way a shell would, falling back to stripping
+    quotes when a quote is unbalanced."""
+    try:
+        return shlex.split(text)
+    except ValueError:
+        return [text.strip("'\"")]
+
+
+def _path_readings(text: str) -> list[list[str]]:
+    """Ways to read the text as one or more paths, most literal first."""
+    readings = [[text], [unicodedata.normalize("NFD", text)]]
+    for prefix in _FILE_URL_PREFIXES:
+        if text.lower().startswith(prefix):
+            readings.append([unquote(text[len(prefix):])])
+            break
+    readings.append(_shell_words(text))
+    return readings
+
+
+def _expand_home(part: str) -> Path:
+    """Path(part).expanduser(), except that "~name" for a user who doesn't
+    exist is left as typed (expanduser raises RuntimeError for it)."""
+    try:
+        return Path(part).expanduser()
+    except RuntimeError:
+        return Path(part)
+
+
+def parse_path_input(raw: str) -> PathInput:
+    """Read a typed, pasted or Finder-dropped path the way a shell would.
+
+    The text as-is comes first, so a real filename containing a backslash or
+    quote still works. Then NFD (some network shares don't normalize names),
+    a file:// URL, and shell word-splitting, which handles `My\\ ISOs`
+    escapes, quoting, and several dropped files at once.
+    """
+    text = sanitize_input(raw)
+    if not text:
+        return PathInput([], None)
+    for parts in _path_readings(text):
+        paths = [_expand_home(part) for part in parts if part]
+        if paths and all(path.exists() for path in paths):
+            return PathInput([path.resolve() for path in paths], None)
+    words = _shell_words(text)
+    best_guess = words[0] if len(words) == 1 else text
+    if not best_guess:  # e.g. a pasted pair of empty quotes
+        return PathInput([], None)
+    return PathInput([], _expand_home(best_guess))
+
+
+def enable_line_editing():
+    """Give input() arrow keys and in-line editing. Loading readline changes
+    every later input() in the process, so only the interactive CLI calls it."""
+    try:
+        import readline  # noqa: F401
+    except ImportError:
+        pass
+
+
+def _line_editing_enabled() -> bool:
+    return "readline" in sys.modules
+
+
+def _read_line_without_history(prompt) -> str:
+    """Read one line through readline, never recording it in history, so
+    Up-arrow can't recall an earlier answer, such as a drive number or "y",
+    into a destructive prompt.
+
+    readline has to draw the prompt itself to know which column the answer
+    starts in; if rich prints it first, edits across a wrapped line redraw in
+    the wrong place. The prompt loses its color here, because libedit cannot
+    draw colored prompts correctly. Only the prompt's last line goes to
+    readline: libedit counts a newline as a column, so "\nPath: " would make
+    it wrap one column early and draw over the character at the edge.
+    """
+    sys.modules["readline"].set_auto_history(False)
+    text = prompt.plain if isinstance(prompt, Text) else str(prompt)
+    earlier_lines, newline, last_line = text.rpartition("\n")
+    if newline:
+        sys.stdout.write(earlier_lines + newline)
+        sys.stdout.flush()
+    return input(last_line)
+
+
+def _turn_off_bracketed_paste(console: Console):
+    """Ask the terminal to send pasted text raw. Shells turn the mode back on
+    themselves at their next prompt."""
+    console.file.write(_BRACKETED_PASTE_OFF)
+    console.file.flush()
+
+
+class _CleanInput:
+    """Mixin for rich prompts: every answer goes through sanitize_input().
+
+    Prompt and Confirm below deliberately keep rich's names, so every existing
+    Prompt.ask / Confirm.ask call site gets clean input without being changed.
+    """
+
+    @classmethod
+    def get_input(cls, console, prompt, password, stream=None):
+        if password:
+            return console.input(prompt, password=True, stream=stream)
+        if stream is not None:
+            return sanitize_input(console.input(prompt, stream=stream))
+        if console.is_terminal:
+            _turn_off_bracketed_paste(console)
+        if _line_editing_enabled():
+            return sanitize_input(_read_line_without_history(prompt))
+        return sanitize_input(console.input(prompt))
+
+
+class Prompt(_CleanInput, _RichPrompt):
+    pass
+
+
+class Confirm(_CleanInput, _RichConfirm):
+    pass
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -942,14 +1096,28 @@ def ask_os_and_iso() -> Path:
 
 # ── ISO ───────────────────────────────────────────────────────────────────────
 
+def _is_iso(path: Path) -> bool:
+    return path.suffix.lower() == ".iso"
+
+
 def ask_iso_path() -> Path:
     while True:
-        raw = Prompt.ask("\n[bold cyan]Path to ISO file[/bold cyan]").strip().strip("'\"")
-        p = Path(raw).expanduser().resolve()
-        if not p.exists():
-            console.print(f"[red]Not found:[/red] {p}")
+        answer = parse_path_input(Prompt.ask("\n[bold cyan]Path to ISO file[/bold cyan]"))
+        if answer.not_found:
+            # repr() so any invisible characters that slipped through show up
+            console.print(f"[red]Not found:[/red] {escape(repr(str(answer.not_found)))}")
             continue
-        if p.suffix.lower() != ".iso":
+        if not answer.found:
+            console.print("[dim]Type or paste the path to an ISO file, or drag it here from Finder.[/dim]")
+            continue
+        files = [path for path in answer.found if path.is_file()]
+        if not files:
+            console.print("[yellow]That's a folder — choose the ISO file inside it.[/yellow]")
+            continue
+        p = next((path for path in files if _is_iso(path)), files[0])
+        if len(answer.found) > 1:
+            console.print(f"[yellow]{len(answer.found)} items dropped — using {escape(p.name)}.[/yellow]")
+        if not _is_iso(p):
             console.print("[yellow]Warning: file doesn't end in .iso — continuing anyway.[/yellow]")
         return p
 
@@ -1604,6 +1772,8 @@ def flash_linux_cli(iso_path: Path, selected: dict, probed: dict, opts: dict, lo
 
 
 def main():
+    enable_line_editing()
+
     if "--version" in sys.argv:
         console.print(f"macos-rufus v{__version__}")
         return

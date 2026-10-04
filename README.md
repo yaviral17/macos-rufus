@@ -49,7 +49,7 @@ If you've ever searched for:
 | **Safe by design** | External-only disk listing, explicit warning, manual confirm before any write |
 | **Parallel file copy** | 4-thread concurrent copy with 1 MB buffers — saturates USB write bandwidth |
 | **Beautiful terminal UI** | Powered by `rich` — color, tables, progress bars with speed + ETA |
-| **Drag-and-drop ISO path** | Drag your `.iso` file into the terminal — quoted paths handled automatically |
+| **Drag-and-drop ISO path** | Drag your `.iso` file into the terminal, or paste its path — escaped spaces, quotes and `file://` links are handled automatically |
 
 ---
 
@@ -192,7 +192,7 @@ Select an OS: 1
 Path to Windows ISO: /Users/you/Downloads/Win11_23H2_English_x64.iso
 ```
 
-Drag and drop the `.iso` file directly from Finder into the terminal — quoted paths are handled automatically.
+Drag and drop the `.iso` file directly from Finder into the terminal, or paste its path — escaped spaces (`My\ ISOs`), quoted paths and `file://` links are handled automatically. Arrow keys work for fixing typos.
 
 **Step 2 — ISO analysis**
 
@@ -383,6 +383,15 @@ still see this error:
 - Make sure Playwright's Chromium is installed: `python3 -m playwright install chromium`
 - Check your internet connection can reach `microsoft.com` normally
 - As a last resort, download the ISO manually (see below) and provide the path when prompted
+
+### Pasted text shows `^[[200~` or `00~`, or a dropped path is "Not found"
+
+These come from your terminal's *bracketed paste* mode, which wraps pasted
+text in hidden markers. macos-rufus turns the mode off while it's asking a
+question and strips any markers that still get through. If you still see
+them, update to the latest version. If a path is still reported as not found,
+the error message shows it in quotes exactly as it was received, so any stray
+characters are visible — please include that line in a bug report.
 
 ### "hdiutil: attach failed"
 
