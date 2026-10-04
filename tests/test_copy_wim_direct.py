@@ -5,15 +5,16 @@ Guards against the ENOTSOCK bug: os.sendfile(2) on macOS/BSD requires the
 destination fd to be a socket, so the file->file form used here previously
 failed with "[Errno 38] Socket operation on non-socket" for every user.
 
-Run: python3 tests/test_copy_wim_direct.py
+Run: python -m pytest tests/  (or: python3 tests/test_copy_wim_direct.py)
 """
 
 import hashlib
 import importlib.util
 import os
 import sys
-import tempfile
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -34,38 +35,23 @@ def sha256(path: Path) -> str:
 SIZES = (0, 1, 4 * 1024 * 1024, 4 * 1024 * 1024 + 1, 10 * 1024 * 1024 + 12345)
 
 
+@pytest.mark.parametrize("size", SIZES)
+def test_copy_wim_direct_roundtrip(size, tmp_path):
+    """copy_wim_direct() must produce a byte-identical sources/install.wim."""
+    src = tmp_path / "install.wim"
+    src.write_bytes(os.urandom(size))
+    usb_root = tmp_path / "usb"
+
+    rufus.copy_wim_direct(src, usb_root)
+
+    dst = usb_root / "sources" / "install.wim"
+    assert dst.exists()
+    assert dst.stat().st_size == size
+    assert sha256(dst) == sha256(src)
+
+
 def main() -> int:
-    failures = []
-    for size in SIZES:
-        with tempfile.TemporaryDirectory() as tmp:
-            src = Path(tmp) / "install.wim"
-            src.write_bytes(os.urandom(size))
-            usb_root = Path(tmp) / "usb"
-
-            try:
-                rufus.copy_wim_direct(src, usb_root)
-            except OSError as exc:
-                failures.append(f"size={size}: OSError errno={exc.errno} ({exc.strerror})")
-                continue
-
-            dst = usb_root / "sources" / "install.wim"
-            if not dst.exists():
-                failures.append(f"size={size}: destination was not created")
-            elif dst.stat().st_size != size:
-                failures.append(f"size={size}: wrote {dst.stat().st_size} bytes")
-            elif sha256(dst) != sha256(src):
-                failures.append(f"size={size}: checksum mismatch")
-            else:
-                print(f"PASS size={size}")
-
-    if failures:
-        print("\nFAILED:")
-        for failure in failures:
-            print(f"  {failure}")
-        return 1
-
-    print("\nAll copy_wim_direct tests passed.")
-    return 0
+    return pytest.main([__file__, "-v"])
 
 
 if __name__ == "__main__":
