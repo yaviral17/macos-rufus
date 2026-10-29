@@ -49,7 +49,7 @@ If you've ever searched for:
 | **Safe by design** | External-only disk listing, explicit warning, manual confirm before any write |
 | **Parallel file copy** | 4-thread concurrent copy with 1 MB buffers — saturates USB write bandwidth |
 | **Beautiful terminal UI** | Powered by `rich` — color, tables, progress bars with speed + ETA |
-| **Drag-and-drop ISO path** | Drag your `.iso` file into the terminal, or paste its path — escaped spaces, quotes and `file://` links are handled automatically |
+| **Drag-and-drop image path** | Drag your `.iso` or `.img` file into the terminal, or paste its path — escaped spaces, quotes and `file://` links are handled automatically |
 
 ---
 
@@ -192,7 +192,7 @@ Select an OS: 1
 Path to Windows ISO: /Users/you/Downloads/Win11_23H2_English_x64.iso
 ```
 
-Drag and drop the `.iso` file directly from Finder into the terminal, or paste its path — escaped spaces (`My\ ISOs`), quoted paths and `file://` links are handled automatically. Arrow keys work for fixing typos.
+Drag and drop the `.iso` or `.img` file directly from Finder into the terminal, or paste its path — escaped spaces (`My\ ISOs`), quoted paths and `file://` links are handled automatically. Arrow keys work for fixing typos. Raw `.img` files (such as the Tails USB image) are written byte-for-byte in DD mode; they are not mounted for ISO analysis or copied as files. Verify the image's checksum with its distributor before flashing.
 
 **Step 2 — ISO analysis**
 

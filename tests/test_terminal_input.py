@@ -218,12 +218,19 @@ class AskIsoPathTest(IsoTreeMixin, unittest.TestCase):
         self.assertEqual(chosen, self.iso)
         self.assertIn("2 items dropped", out)
 
-    def test_non_iso_file_accepted_with_warning(self):
+    def test_img_file_accepted_without_warning(self):
         image = self.tmp / "disk.img"
         image.touch()
         chosen, out = self._ask(str(image))
         self.assertEqual(chosen, image)
-        self.assertIn("doesn't end in .iso", out)
+        self.assertNotIn("Warning", out)
+
+    def test_other_file_accepted_with_warning(self):
+        other = self.tmp / "notes.txt"
+        other.touch()
+        chosen, out = self._ask(str(other))
+        self.assertEqual(chosen, other)
+        self.assertIn("doesn't end in .iso or .img", out)
 
 
 @unittest.skipUnless(pty is not None, "needs a pty")

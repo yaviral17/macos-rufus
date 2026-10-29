@@ -81,7 +81,7 @@ class DownloadWorker(QThread):
     progress = Signal(int, int)  # downloaded, total
     finished_ok = Signal(str)    # dest path
     error = Signal(str)
-    paused = Signal(str)         # dest path of the paused .iso.part
+    paused = Signal(str)         # dest path of the paused image
 
     def __init__(self, mode: str, **kwargs):
         super().__init__()
@@ -131,7 +131,7 @@ class DownloadWorker(QThread):
             "sku_language_raw": sku["Language"], "option_name": chosen.get("Name"),
             "url": url, "dest": str(dest), "created": datetime.now().isoformat(),
         }
-        rufus._write_download_state(dest.with_suffix(".iso.part"), state)
+        rufus._write_download_state(dest.with_name(dest.name + ".part"), state)
 
         self._download_fresh(session, url, dest)
 
@@ -148,13 +148,13 @@ class DownloadWorker(QThread):
         entry, option = self.kwargs["entry"], self.kwargs["option"]
         dest = self.kwargs["downloads_dir"] / rufus.direct_filename(entry, option)
         self._dest = dest
-        self.status.emit(f"Looking up the latest {entry['name']} ISO...")
+        self.status.emit(f"Looking up the latest {entry['name']} image...")
         url = rufus.resolve_option_url(option)
         state = {
             "entry_name": entry["name"], "direct": True, "sku_language": option["label"],
             "url": url, "dest": str(dest), "created": datetime.now().isoformat(),
         }
-        rufus._write_download_state(dest.with_suffix(".iso.part"), state)
+        rufus._write_download_state(dest.with_name(dest.name + ".part"), state)
         self._download_fresh(rufus._plain_session(), url, dest)
 
     def _run_resume(self):
@@ -359,10 +359,10 @@ class IsoAcquirePage(QWidget):
         self.layout_.addWidget(self.status_label)
 
         # -- manual path widgets --
-        self.manual_box = QGroupBox("ISO file")
+        self.manual_box = QGroupBox("ISO or IMG file")
         mv = QVBoxLayout(self.manual_box)
         self.path_label = QLabel("No file selected")
-        browse_btn = QPushButton("Browse for .iso file...")
+        browse_btn = QPushButton("Browse for .iso or .img file...")
         browse_btn.clicked.connect(self._browse)
         mv.addWidget(self.path_label)
         mv.addWidget(browse_btn)
@@ -445,7 +445,7 @@ class IsoAcquirePage(QWidget):
                     self.direct_combo.addItem(o["label"], o)
                 self.direct_box.setVisible(True)
                 if not self.selected_path:
-                    self.status_label.setText("Pick a version to download, or browse for an existing ISO.")
+                    self.status_label.setText("Pick a version to download, or browse for an existing image.")
             elif entry["name"] != "I already have an ISO file":
                 self.status_label.setText(
                     f"{entry['name']} isn't available as a direct Microsoft download anymore. "
@@ -515,7 +515,7 @@ class IsoAcquirePage(QWidget):
         self.status_label.setText(f"Couldn't reach Microsoft: {message}\nUse Browse to select an ISO manually.")
 
     def _browse(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select Windows ISO", str(Path.home()), "ISO files (*.iso)")
+        path, _ = QFileDialog.getOpenFileName(self, "Select ISO or IMG image", str(Path.home()), "Disk images (*.iso *.img)")
         if path:
             self.selected_path = Path(path)
             self.path_label.setText(str(self.selected_path))
@@ -694,8 +694,8 @@ class ConfirmPage(QWidget):
         self.summary_label = QLabel("")
         layout.addWidget(self.summary_label)
 
-        # -- Linux settings (shown only for Linux ISOs) --
-        self.linux_box = QGroupBox("Linux USB settings")
+        # -- Linux settings (shown for Linux images) --
+        self.linux_box = QGroupBox("Linux image settings")
         lv = QVBoxLayout(self.linux_box)
         self.live_radio = QRadioButton("Live bootable USB (write image as-is) — recommended")
         self.live_radio.setToolTip("Boots on BIOS and UEFI. Works for live sessions and installers.")
@@ -762,7 +762,7 @@ class ConfirmPage(QWidget):
         self.warning_label.setText(
             f"{drive['node']} ({drive['name']}, {fmt_size(drive['size'])}) will be COMPLETELY ERASED."
         )
-        self.summary_label.setText(f"ISO: {iso_path.name}")
+        self.summary_label.setText(f"Image: {iso_path.name}")
         self.checkbox.setChecked(False)
 
     def _on_checked(self, state):
@@ -1034,7 +1034,7 @@ class MainWindow(QMainWindow):
         try:
             self.probed = rufus.probe_iso(self.iso_path)
         except Exception as e:
-            QMessageBox.critical(self, "Couldn't read ISO", str(e))
+            QMessageBox.critical(self, "Couldn't read image", str(e))
             return
         if self.probed["kind"] == "linux" and not (self.probed["hybrid"] or self.probed["uefi"]):
             QMessageBox.critical(self, "Unsupported ISO",
@@ -1043,7 +1043,7 @@ class MainWindow(QMainWindow):
             return
         if self.probed["kind"] == "linux" and self.probed["hybrid"] and self.probed["size"] > drive["size"]:
             QMessageBox.critical(self, "Drive too small",
-                                 f"The ISO ({fmt_size(self.probed['size'])}) is larger than the drive.")
+                                 f"The image ({fmt_size(self.probed['size'])}) is larger than the drive.")
             return
         self.confirm_page.load(self.iso_path, drive, self.probed)
         self.stack.setCurrentWidget(self.confirm_page)
