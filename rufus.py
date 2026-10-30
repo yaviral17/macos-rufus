@@ -1410,8 +1410,13 @@ def set_mbr_active_partition(disk_node: str):
     Partition table starts at MBR byte 446; each entry is 16 bytes.
     """
     raw = disk_node.replace("/dev/disk", "/dev/rdisk")
-    # Must unmount before opening raw disk device — macOS blocks rdisk while mounted
-    run(["diskutil", "unmountDisk", disk_node], check=False)
+    # Must unmount before opening raw disk device — macOS blocks rdisk while mounted.
+    # diskutil eraseDisk remounts the new volume right away and a system service
+    # can briefly hold it, so a non-forced unmount may be refused.
+    result = run(["diskutil", "unmountDisk", "force", disk_node], check=False)
+    if result.returncode != 0:
+        log.warning("unmountDisk %s failed: %s", disk_node,
+                    (result.stdout + result.stderr).strip())
     with open(raw, "rb") as f:
         mbr = bytearray(f.read(512))
     for i, off in enumerate((446, 462, 478, 494)):
@@ -1891,8 +1896,11 @@ def main():
 
         # 6. Write Windows boot sector (legacy BIOS support — Win7 + fallback for all)
         console.print("\n[dim]Writing boot sectors...[/dim]")
-        log.info("Writing MBR active partition flag")
-        set_mbr_active_partition(disk_node)
+        # The active flag only matters for legacy BIOS boot via the VBR, which
+        # is only written when the ISO ships boot/bootsect.dat.
+        if iso_info["has_bootsect"]:
+            log.info("Writing MBR active partition flag")
+            set_mbr_active_partition(disk_node)
         log.info("Writing Windows VBR")
         write_windows_vbr(disk_node, mount_point)
 

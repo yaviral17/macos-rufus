@@ -111,7 +111,8 @@ def main():
         emit(progress_file, stage="format", status="done")
 
         emit(progress_file, stage="bootsectors", status="start")
-        rufus.set_mbr_active_partition(disk_node)
+        if iso_info["has_bootsect"]:
+            rufus.set_mbr_active_partition(disk_node)
         rufus.write_windows_vbr(disk_node, mount_point)
         emit(progress_file, stage="bootsectors", status="done")
 
