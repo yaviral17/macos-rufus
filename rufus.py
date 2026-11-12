@@ -419,7 +419,7 @@ OS_CATALOG = [
 def direct_filename(entry: dict, option: dict) -> str:
     """Matches the prefix find_existing_isos() globs for."""
     prefix = entry['name'].replace(' ', '').replace('.', '').replace('!', '')
-    return f"{prefix}_{option.get('tag') or 'en-us_' + option['arch']}.iso"
+    return f"{prefix}_{option.get('tag') or 'en-us_' + option['arch']}{option.get('extension', '.iso')}"
 
 
 def _scrape_latest(index_url: str, pattern: str) -> str:
@@ -485,7 +485,7 @@ _DOWNLOAD_UA = (
 _MS_ORG_ID = "y6jn8c31"
 _MS_PROFILE = "606624d44113"
 
-_ISO_STATE_SUFFIX = ".json"  # sidecar next to a "*.iso.part" file
+_ISO_STATE_SUFFIX = ".json"  # sidecar next to an image's ".part" file
 
 
 # The whole script re-execs itself under `sudo` (see escalate_to_root), which
@@ -527,16 +527,19 @@ def get_downloads_dir() -> Path:
 
 def find_existing_isos(entry: dict, downloads_dir: Path) -> list[Path]:
     prefix = entry["name"].replace(" ", "").replace(".", "")
-    matches = sorted(downloads_dir.glob(f"{prefix}_*.iso"),
-                      key=lambda p: p.stat().st_mtime, reverse=True)
+    matches = sorted((p for p in downloads_dir.glob(f"{prefix}_*")
+                      if p.suffix.lower() in (".iso", ".img")),
+                     key=lambda p: p.stat().st_mtime, reverse=True)
     return matches
 
 
 def find_incomplete_downloads(downloads_dir: Path) -> list[dict]:
-    """Partial downloads left behind by an interrupted run — each ``*.iso.part``
-    has a JSON sidecar with everything needed to resume or regenerate the link."""
+    """Partial image downloads left behind by an interrupted run have a JSON
+    sidecar with everything needed to resume or regenerate the link."""
     found = []
-    for part in downloads_dir.glob("*.iso.part"):
+    for part in downloads_dir.glob("*.part"):
+        if part.with_suffix("").suffix.lower() not in (".iso", ".img"):
+            continue
         state_path = part.with_name(part.name + _ISO_STATE_SUFFIX)
         if not state_path.exists():
             continue
@@ -739,7 +742,7 @@ def download_iso_with_progress(session: requests.Session, url: str, dest: Path, 
     should_pause() is polled between chunks when given; if it returns True,
     the download stops cleanly (like a Ctrl+C pause) instead of continuing —
     used by the GUI's Pause button."""
-    tmp_dest = dest.with_suffix(".iso.part")
+    tmp_dest = dest.with_name(dest.name + ".part")
     headers = {}
     initial = 0
     if resume and tmp_dest.exists():
@@ -933,7 +936,7 @@ def download_windows_iso(entry: dict, downloads_dir: Path) -> Path:
         "dest": str(dest),
         "created": datetime.now().isoformat(),
     }
-    _write_download_state(dest.with_suffix(".iso.part"), state)
+    _write_download_state(dest.with_name(dest.name + ".part"), state)
 
     console.print(f"[green]✓ Got download link[/green] — saving to {dest}")
     download_iso_with_progress(session, url, dest)
@@ -965,13 +968,13 @@ def download_direct_iso(entry: dict, downloads_dir: Path) -> Path:
             console.print(f"[red]Enter 1–{len(options)}.[/red]")
 
     dest = downloads_dir / direct_filename(entry, chosen)
-    console.print(f"[dim]Looking up the latest {entry['name']} ISO...[/dim]")
+    console.print(f"[dim]Looking up the latest {entry['name']} image...[/dim]")
     url = resolve_option_url(chosen)
     state = {
         "entry_name": entry["name"], "direct": True, "sku_language": chosen["label"],
         "url": url, "dest": str(dest), "created": datetime.now().isoformat(),
     }
-    _write_download_state(dest.with_suffix(".iso.part"), state)
+    _write_download_state(dest.with_name(dest.name + ".part"), state)
     console.print(f"[green]✓ Saving {chosen['label']}[/green] to {dest}")
     download_iso_with_progress(_plain_session(), url, dest)
     console.print(f"[green]✓ Downloaded {dest.name}[/green]")
@@ -1097,28 +1100,28 @@ def ask_os_and_iso() -> Path:
 # ── ISO ───────────────────────────────────────────────────────────────────────
 
 def _is_iso(path: Path) -> bool:
-    return path.suffix.lower() == ".iso"
+    return path.suffix.lower() in (".iso", ".img")
 
 
 def ask_iso_path() -> Path:
     while True:
-        answer = parse_path_input(Prompt.ask("\n[bold cyan]Path to ISO file[/bold cyan]"))
+        answer = parse_path_input(Prompt.ask("\n[bold cyan]Path to ISO or IMG file[/bold cyan]"))
         if answer.not_found:
             # repr() so any invisible characters that slipped through show up
             console.print(f"[red]Not found:[/red] {escape(repr(str(answer.not_found)))}")
             continue
         if not answer.found:
-            console.print("[dim]Type or paste the path to an ISO file, or drag it here from Finder.[/dim]")
+            console.print("[dim]Type or paste the path to an ISO or IMG file, or drag it here from Finder.[/dim]")
             continue
         files = [path for path in answer.found if path.is_file()]
         if not files:
-            console.print("[yellow]That's a folder — choose the ISO file inside it.[/yellow]")
+            console.print("[yellow]That's a folder — choose the image file inside it.[/yellow]")
             continue
         p = next((path for path in files if _is_iso(path)), files[0])
         if len(answer.found) > 1:
             console.print(f"[yellow]{len(answer.found)} items dropped — using {escape(p.name)}.[/yellow]")
         if not _is_iso(p):
-            console.print("[yellow]Warning: file doesn't end in .iso — continuing anyway.[/yellow]")
+            console.print("[yellow]Warning: file doesn't end in .iso or .img — continuing anyway.[/yellow]")
         return p
 
 
@@ -1185,8 +1188,27 @@ def _is_hybrid_iso(iso: Path) -> bool:
 
 
 def probe_iso(iso: Path) -> dict:
-    """Quietly mount the ISO and classify it. Returns
-    {kind: windows|linux|unknown, hybrid, uefi, label, size}."""
+    """Treat .img as a raw disk image; mount ISOs to classify them. Returns
+    {kind: windows|linux|unknown, hybrid, uefi, label, size, raw?}."""
+    if iso.suffix.lower() == ".img":
+        with iso.open("rb") as image:
+            sector = image.read(512)
+            gpt_signature = image.read(8)
+        size = iso.stat().st_size
+        valid_partition = False
+        if len(sector) == 512 and sector[510:512] == b"\x55\xaa":
+            for i in range(446, 510, 16):
+                entry = sector[i:i + 16]
+                start = int.from_bytes(entry[8:12], "little")
+                count = int.from_bytes(entry[12:16], "little")
+                if (entry[4] and start and count and (start + count) * 512 <= size
+                        and (entry[4] != 0xEE or gpt_signature == b"EFI PART")):
+                    valid_partition = True
+                    break
+        if not valid_partition:
+            raise ValueError("Not a raw disk image with a valid MBR partition table")
+        return {"kind": "linux", "hybrid": True, "uefi": False, "raw": True,
+                "label": iso.stem, "size": size}
     mount_point = mount_iso(iso)
     try:
         mp = Path(mount_point)
@@ -1209,14 +1231,14 @@ def probe_iso(iso: Path) -> dict:
 
 
 def ask_linux_options(info: dict, disk_size: int) -> dict:
-    """Interactive Rufus-style settings for a Linux ISO."""
+    """Interactive settings for a Linux ISO or raw image."""
     console.print()
-    t = Table(title="Linux ISO detected", box=None, padding=(0, 2))
+    t = Table(title="Linux image detected", box=None, padding=(0, 2))
     t.add_column(style="dim")
     t.add_column(style="bold")
     t.add_row("Volume label", info["label"])
     t.add_row("Size", fmt_size(info["size"]))
-    t.add_row("Hybrid (raw-writable)", "[green]Yes[/green]" if info["hybrid"] else "[yellow]No[/yellow]")
+    t.add_row("Raw-writable", "[green]Yes[/green]" if info["hybrid"] else "[yellow]No[/yellow]")
     t.add_row("UEFI boot files", "[green]Yes[/green]" if info["uefi"] else "[yellow]Not found[/yellow]")
     console.print(t)
 
@@ -1224,10 +1246,10 @@ def ask_linux_options(info: dict, disk_size: int) -> dict:
 
     if info["hybrid"]:
         console.print(
-            "\n[bold]Live bootable USB[/bold] — writes the ISO to the drive exactly as-is (\"DD mode\"). "
+            "\n[bold]Live bootable USB[/bold] — writes the image to the drive exactly as-is (\"DD mode\"). "
             "Boots on both BIOS and UEFI machines and works for live sessions and installers."
         )
-        if Confirm.ask("Create a live bootable USB this way?", default=True):
+        if info.get("raw") or Confirm.ask("Create a live bootable USB this way?", default=True):
             opts["mode"] = "dd"
         else:
             console.print("[dim]Falling back to file-copy mode (UEFI only).[/dim]")
@@ -1241,7 +1263,7 @@ def ask_linux_options(info: dict, disk_size: int) -> dict:
 
     if opts["mode"] == "dd":
         if disk_size and info["size"] > disk_size:
-            raise RuntimeError(f"ISO ({fmt_size(info['size'])}) is larger than the drive ({fmt_size(disk_size)}).")
+            raise RuntimeError(f"Image ({fmt_size(info['size'])}) is larger than the drive ({fmt_size(disk_size)}).")
         opts["verify"] = Confirm.ask("Verify the drive after writing? (slower, catches bad sticks)", default=False)
     else:
         console.print("\n[bold]Advanced settings[/bold]")
