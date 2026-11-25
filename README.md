@@ -395,6 +395,9 @@ characters are visible — please include that line in a bug report.
 
 ### "hdiutil: attach failed"
 
+- Hybrid Linux ISOs (Ubuntu etc.) that macOS reports as "no mountable file
+  systems" are handled automatically: macos-rufus retries by attaching the image
+  without mounting and mounting the raw device as ISO 9660
 - Verify the ISO isn't corrupted — check SHA256 against Microsoft's published hash
 - Check the ISO isn't already mounted (look in Finder sidebar or `diskutil list`)
 
