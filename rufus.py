@@ -1125,10 +1125,43 @@ def ask_iso_path() -> Path:
         return p
 
 
+# Mount points created by the cd9660 fallback -> backing /dev/diskN to detach.
+_FALLBACK_MOUNTS: dict[str, str] = {}
+
+
+def _mount_iso_cd9660(iso: Path) -> str:
+    """Fallback for hybrid ISOs (Ubuntu etc.) that hdiutil refuses to mount.
+
+    macOS sees their MBR/APM hybrid layout and finds no mountable filesystem,
+    so attach without mounting and mount the raw device as ISO 9660 ourselves.
+    """
+    result = run(["hdiutil", "attach", "-nomount", "-readonly", "-nobrowse", str(iso)])
+    dev = None
+    for line in result.stdout.splitlines():
+        first = line.split()[0] if line.split() else ""
+        if re.fullmatch(r"/dev/disk\d+", first):
+            dev = first
+            break
+    if not dev:
+        raise RuntimeError(f"Could not find device for ISO:\n{result.stdout}")
+    mount_point = tempfile.mkdtemp(prefix="rufus-iso-")
+    try:
+        run(["mount", "-t", "cd9660", "-o", "rdonly", dev, mount_point])
+    except subprocess.CalledProcessError:
+        run(["hdiutil", "detach", dev, "-force"], check=False)
+        os.rmdir(mount_point)
+        raise
+    _FALLBACK_MOUNTS[mount_point] = dev
+    return mount_point
+
+
 def mount_iso(iso: Path) -> str:
     """Mount ISO read-only via hdiutil, return mount point path."""
     console.print(f"\n[dim]Mounting {iso.name}...[/dim]")
-    result = run(["hdiutil", "attach", "-nobrowse", "-readonly", str(iso)])
+    try:
+        result = run(["hdiutil", "attach", "-nobrowse", "-readonly", str(iso)])
+    except subprocess.CalledProcessError:
+        return _mount_iso_cd9660(iso)
     for line in reversed(result.stdout.strip().splitlines()):
         parts = line.split("\t")
         if len(parts) >= 3 and parts[-1].strip().startswith("/"):
@@ -1137,6 +1170,15 @@ def mount_iso(iso: Path) -> str:
 
 
 def unmount_iso(mount_point: str):
+    dev = _FALLBACK_MOUNTS.pop(mount_point, None)
+    if dev:
+        run(["umount", "-f", mount_point], check=False)
+        run(["hdiutil", "detach", dev, "-force"], check=False)
+        try:
+            os.rmdir(mount_point)
+        except OSError:
+            pass
+        return
     run(["hdiutil", "detach", mount_point, "-force"], check=False)
 
 
