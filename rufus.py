@@ -1129,13 +1129,17 @@ def ask_iso_path() -> Path:
 _FALLBACK_MOUNTS: dict[str, str] = {}
 
 
-def _mount_iso_cd9660(iso: Path) -> str:
+def _mount_iso_cd9660(iso: Path) -> str | None:
     """Fallback for hybrid ISOs (Ubuntu etc.) that hdiutil refuses to mount.
 
-    macOS sees their MBR/APM hybrid layout and finds no mountable filesystem,
+    macOS sees their MBR/GPT hybrid layout and finds no mountable filesystem,
     so attach without mounting and mount the raw device as ISO 9660 ourselves.
+    Returns None (with nothing left attached) if that doesn't work either.
     """
-    result = run(["hdiutil", "attach", "-nomount", "-readonly", "-nobrowse", str(iso)])
+    result = run(["hdiutil", "attach", "-nomount", "-readonly", "-nobrowse", str(iso)], check=False)
+    if result.returncode != 0:
+        log.warning("hdiutil attach -nomount failed: %s", (result.stderr or "").strip())
+        return None
     dev = None
     for line in result.stdout.splitlines():
         first = line.split()[0] if line.split() else ""
@@ -1143,30 +1147,73 @@ def _mount_iso_cd9660(iso: Path) -> str:
             dev = first
             break
     if not dev:
-        raise RuntimeError(f"Could not find device for ISO:\n{result.stdout}")
+        log.warning("No whole-disk device in hdiutil output:\n%s", result.stdout)
+        return None
     mount_point = tempfile.mkdtemp(prefix="rufus-iso-")
-    try:
-        run(["mount", "-t", "cd9660", "-o", "rdonly", dev, mount_point])
-    except subprocess.CalledProcessError:
+    mounted = run(["mount", "-t", "cd9660", "-o", "rdonly", dev, mount_point], check=False)
+    if mounted.returncode != 0:
+        log.warning("cd9660 mount of %s failed: %s", dev, (mounted.stderr or "").strip())
         run(["hdiutil", "detach", dev, "-force"], check=False)
         os.rmdir(mount_point)
-        raise
+        return None
     _FALLBACK_MOUNTS[mount_point] = dev
+    log.info("Mounted %s as cd9660 (%s -> %s)", iso.name, dev, mount_point)
     return mount_point
 
 
 def mount_iso(iso: Path) -> str:
     """Mount ISO read-only via hdiutil, return mount point path."""
     console.print(f"\n[dim]Mounting {iso.name}...[/dim]")
-    try:
-        result = run(["hdiutil", "attach", "-nobrowse", "-readonly", str(iso)])
-    except subprocess.CalledProcessError:
-        return _mount_iso_cd9660(iso)
+    result = run(["hdiutil", "attach", "-nobrowse", "-readonly", str(iso)], check=False)
+    if result.returncode != 0:
+        # Newer macOS prefixes stderr with an "hdiutil is deprecated" warning; skip it.
+        error = "\n".join(line for line in (result.stderr or result.stdout or "").splitlines()
+                          if line.strip() and "WARNING:" not in line)
+        log.info("hdiutil attach failed (%s), trying cd9660 fallback", error)
+        mount_point = _mount_iso_cd9660(iso)
+        if mount_point:
+            return mount_point
+        # Report hdiutil's own reason — it's the one that explains a bad ISO.
+        raise RuntimeError(f"Couldn't mount {iso.name}: {error or 'hdiutil attach failed'}")
     for line in reversed(result.stdout.strip().splitlines()):
         parts = line.split("\t")
         if len(parts) >= 3 and parts[-1].strip().startswith("/"):
             return parts[-1].strip()
     raise RuntimeError(f"Could not parse mount point:\n{result.stdout}")
+
+
+def _iso_volume_label(iso: Path) -> str:
+    """Volume ID from the ISO 9660 primary volume descriptor, or '' if there
+    isn't one. This is the label distros like Arch look for at boot."""
+    try:
+        with iso.open("rb") as f:
+            for sector in range(16, 32):  # descriptor set starts at sector 16
+                f.seek(sector * 2048)
+                desc = f.read(72)
+                if len(desc) < 72 or desc[1:6] != b"CD001" or desc[0] == 0xFF:
+                    break
+                if desc[0] == 0x01:
+                    return desc[40:72].decode("ascii", "replace").strip()
+    except OSError:
+        pass
+    return ""
+
+
+def _exists_ci(root: Path, rel: str) -> bool:
+    """Case-insensitive exists() for a '/'-separated path under root. cd9660
+    mounts are case-sensitive and ISOs disagree on e.g. EFI/BOOT vs EFI/boot."""
+    cur = root
+    for part in rel.split("/"):
+        if not (cur / part).exists():
+            try:
+                with os.scandir(cur) as entries:
+                    part = next((e.name for e in entries if e.name.lower() == part.lower()), None)
+            except OSError:
+                return False
+            if part is None:
+                return False
+        cur = cur / part
+    return True
 
 
 def unmount_iso(mount_point: str):
@@ -1254,18 +1301,19 @@ def probe_iso(iso: Path) -> dict:
     mount_point = mount_iso(iso)
     try:
         mp = Path(mount_point)
-        is_windows = (mp / "bootmgr").exists() or (mp / "sources" / "install.wim").exists() \
-            or (mp / "sources" / "install.esd").exists()
-        has_uefi = any((mp / "EFI" / "BOOT" / n).exists() or (mp / "efi" / "boot" / n).exists()
-                       for n in ("BOOTx64.EFI", "bootx64.efi", "BOOTX64.EFI"))
+        is_windows = any(_exists_ci(mp, p)
+                         for p in ("bootmgr", "sources/install.wim", "sources/install.esd"))
+        has_uefi = _exists_ci(mp, "efi/boot/bootx64.efi")
         linux_markers = ("casper", "live", "arch", "isolinux", "syslinux", "boot/grub",
                          "loader/entries", "LiveOS", "boot/syslinux")
-        is_linux = not is_windows and any((mp / m).exists() for m in linux_markers)
+        is_linux = not is_windows and any(_exists_ci(mp, m) for m in linux_markers)
+        # A fallback mount lives in a temp dir, so its name isn't the label.
+        fallback_name = iso.stem if mount_point in _FALLBACK_MOUNTS else mp.name
         return {
             "kind": "windows" if is_windows else "linux" if is_linux else "unknown",
             "hybrid": _is_hybrid_iso(iso),
             "uefi": has_uefi,
-            "label": mp.name,
+            "label": _iso_volume_label(iso) or fallback_name,
             "size": iso.stat().st_size,
         }
     finally:
